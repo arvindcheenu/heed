@@ -46,7 +46,8 @@ export async function summarize(report, { size = 'small', onStatus = () => {}, o
     await loading;
   }
   onStatus('Writing the summary with ' + name + '…', 1);
-  const facts = JSON.stringify(report, null, 1);
+  // compact JSON, empty fields dropped: fewer tokens for the model to read first
+  const facts = JSON.stringify(report, (k, v) => (v === null || (Array.isArray(v) && !v.length) ? undefined : v));
   const chunks = await engine.chat.completions.create({
     messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: 'Session facts:\n' + facts }],
     stream: true, temperature: 0.2, max_tokens: 420
