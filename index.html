@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>heed playground</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: toolbar · stage (chat or dashboard) + heed console · full-width matrices and event trails; one column on phones */
+:root {
+  --bg: #ffffff; --fg: #09090b; --muted: #71717a; --line: #e4e4e7; --card: #ffffff; --soft: #f4f4f5;
+  --accent: #2563eb; --accent-soft: #eff6ff; --accent-line: #bfdbfe; --gaze: #db2777;
+  --warn: #d97706; --warn-soft: #fffbeb; --ok: #16a34a; --bar: #a1a1aa; --bar-hi: #18181b;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #09090b; --fg: #fafafa; --muted: #a1a1aa; --line: #27272a; --card: #0c0c0f; --soft: #18181b;
+  --accent: #60a5fa; --accent-soft: #172554; --accent-line: #1e3a8a; --gaze: #f472b6;
+  --warn: #f59e0b; --warn-soft: #2a1a05; --ok: #4ade80; --bar: #52525b; --bar-hi: #e4e4e7; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #09090b; --fg: #fafafa; --muted: #a1a1aa; --line: #27272a; --card: #0c0c0f; --soft: #18181b;
+  --accent: #60a5fa; --accent-soft: #172554; --accent-line: #1e3a8a; --gaze: #f472b6;
+  --warn: #f59e0b; --warn-soft: #2a1a05; --ok: #4ade80; --bar: #52525b; --bar-hi: #e4e4e7; color-scheme: dark }
+:root { --heed-tint: var(--accent); --heed-badge-bg: var(--accent-soft); --heed-badge-fg: var(--accent); --heed-badge-line: var(--accent-line);
+  --heed-warn: var(--warn); --heed-notice: var(--warn); --heed-card: var(--card); --heed-card-fg: var(--fg); --heed-line: var(--line);
+  --heed-muted: var(--muted); --heed-btn: var(--soft); --heed-btn-hover: var(--line); --heed-gaze: var(--gaze); }
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 var(--font); margin: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 16px 40px; }
+.wrap { max-width: 1320px; margin: 0 auto; display: grid; gap: 16px; }
+header { display: grid; gap: 10px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+h1 span { color: var(--muted); font-weight: 400; }
+.sub { color: var(--muted); margin: 0; max-width: 78ch; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.toolbar .sep { width: 1px; height: 20px; background: var(--line); }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+@media (max-width: 1000px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.panel { border: 1px solid var(--line); border-radius: 10px; background: var(--card); display: grid; gap: 12px; padding: 16px; min-width: 0; }
+.panel > h2 { font-size: 13px; font-weight: 600; margin: 0; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; }
+.panel > h2 small { color: var(--muted); font-weight: 400; }
+.label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 500; }
+.field { display: grid; gap: 6px; border-radius: 8px; }
+.empty { color: var(--muted); font-size: 12px; margin: 0; }
+
+button { font: inherit; font-size: 13px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); color: var(--fg); padding: 5px 10px; cursor: pointer; }
+button:hover { background: var(--soft); }
+button.primary { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+button.primary:hover { opacity: .88; }
+button:disabled { opacity: .5; cursor: default; }
+button:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.seg { display: flex; flex-wrap: wrap; gap: 4px; padding: 3px; background: var(--soft); border-radius: 8px; width: fit-content; max-width: 100%; }
+.seg button { border: 0; background: transparent; padding: 4px 10px; border-radius: 6px; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.switch { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; user-select: none; }
+.switch input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+.state { font-size: 12px; color: var(--muted); }
+.state.accepted { color: var(--ok); } .state.flagged { color: var(--warn); }
+.btns { display: inline-flex; gap: 6px; }
+.btns button { padding: 3px 9px; font-size: 12px; }
+textarea { width: 100%; min-height: 64px; resize: vertical; font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+svg { width: 100%; height: auto; display: block; }
+svg text { fill: var(--muted); font: 10px var(--font); }
+figure { margin: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; background: var(--card); }
+figcaption { font-size: 12.5px; font-weight: 500; }
+figcaption span { font: 11.5px var(--mono); color: var(--muted); margin-right: 6px; }
+
+/* chat */
+.chat { display: grid; gap: 14px; max-width: 760px; }
+.msg { border-radius: 12px; padding: 10px 14px; }
+.msg.user { justify-self: end; background: var(--soft); max-width: 85%; }
+.msg.ai { display: grid; gap: 10px; padding: 4px 0; }
+.who { font-size: 11px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .06em; }
+.msg p { margin: 0; }
+.claims { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.claim { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.claim > span:first-child { flex: 1 1 260px; }
+.ref { font: 11px var(--mono); color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+.sources { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 640px) { .sources { grid-template-columns: minmax(0, 1fr); } }
+.composer { display: grid; gap: 8px; border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+.composer textarea { border: 0; padding: 4px; min-height: 52px; }
+.composer textarea:focus-visible { outline: none; }
+.composer-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.composer-row .stats { flex: 1 1 auto; min-width: 0; flex-wrap: nowrap; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+.composer-row .stats span + span { margin-left: 10px; }
+.stats { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.stats b { color: var(--fg); font: 600 12px var(--mono); }
+
+/* dashboard */
+.dash { display: grid; gap: 12px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.chips button { border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+.chips button[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.kpi { border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: grid; gap: 2px; }
+.kpi b { font-size: 24px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.kpi small { color: var(--muted); }
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 640px) { .kpis, .charts { grid-template-columns: minmax(0, 1fr); } }
+.insight { border: 1px solid var(--accent-line); background: var(--accent-soft); border-radius: 8px; padding: 12px; display: grid; gap: 8px; }
+.insight .claim { background: var(--card); }
+
+/* console */
+.log { display: grid; gap: 6px; max-height: 240px; overflow-y: auto; }
+.f { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 8px; font-size: 12px; align-items: start; }
+.pill { font: 11px var(--mono); padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); text-align: center; color: var(--muted); }
+.pill.warn, .pill.error { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.pill.notice { color: var(--warn); border-style: dashed; border-color: var(--warn); }
+.pill.info { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+pre { white-space: pre-wrap; word-break: break-word; margin: 0; font: 11.5px/1.5 var(--mono); background: var(--soft); border-radius: 8px; padding: 10px; }
+details summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 500; }
+details[open] summary { margin-bottom: 6px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.face { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; align-items: start; }
+.face canvas { width: 120px; height: 90px; border-radius: 8px; background: var(--soft); }
+dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; font-size: 12px; }
+dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+.meter { display: inline-block; vertical-align: middle; width: 48px; height: 5px; border-radius: 999px; background: var(--soft); overflow: hidden; margin-right: 6px; }
+.meter i { display: block; height: 100%; background: var(--accent); }
+.lanes { overflow-x: auto; } .lanes canvas { display: block; width: 100%; min-width: 560px; }
+.gaze-dot { position: fixed; left: 0; top: 0; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%; pointer-events: none; z-index: 2147483500;
+  border: 2px solid var(--gaze); background: color-mix(in srgb, var(--gaze) 20%, transparent); }
+.hud { position: fixed; z-index: 2147482400; pointer-events: none; left: max(12px, env(safe-area-inset-left, 0px)); bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  display: flex; gap: 10px; align-items: center; padding: 8px 12px 8px 8px; border-radius: 12px; background: var(--card); border: 1px solid var(--line);
+  box-shadow: 0 8px 24px -12px rgba(0,0,0,.35); font: 11px/1.45 var(--mono); color: var(--muted); max-width: calc(100vw - 24px); }
+.hud canvas { width: 80px; height: 60px; border-radius: 6px; background: var(--soft); flex: none; }
+.hud b { color: var(--fg); font-weight: 600; }
+@media (max-width: 700px) { .face { grid-template-columns: minmax(0, 1fr); } .face canvas { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>heed <span>playground · 0.4</span></h1>
+    <p class="sub">Two layouts with AI output that cites its evidence. Read, check and accept or flag claims as you normally would. heed captures cursor, scroll, typing, actions and, with the camera on, face and gaze, then shows coverage, your path, transitions between regions and the behaviours it names.</p>
+    <div class="toolbar" data-heed-ignore>
+      <div class="seg" id="layout" role="tablist" aria-label="Layout"><button type="button" data-v="chat" aria-pressed="true">Chat</button><button type="button" data-v="dash" aria-pressed="false">Dashboard</button></div>
+      <span class="sep" aria-hidden="true"></span>
+      <label class="switch"><input type="checkbox" id="show" checked> Coverage</label>
+      <label class="switch"><input type="checkbox" id="trail" checked> Trail</label>
+      <label class="switch"><input type="checkbox" id="links" checked> Transitions</label>
+      <label class="switch"><input type="checkbox" id="notify" checked> Notify</label>
+      <span class="sep cam-only" hidden aria-hidden="true"></span>
+      <button type="button" id="cam" class="primary cam-only" hidden>Start camera</button>
+      <button type="button" id="calib" class="cam-only" hidden disabled>Calibrate gaze</button>
+      <span class="state" id="cam-state">Cursor, scroll, typing and actions</span>
+    </div>
+  </header>
+
+  <div class="main">
+    <div class="panel">
+      <!-- CHAT -->
+      <section id="tab-chat" class="chat" aria-label="Chat layout">
+        <div class="msg user" data-heed="c-question" data-heed-label="Question">Which factory is behind the night-time methylchloride peaks in Mistford?</div>
+        <div class="msg ai">
+          <span class="who">Assistant</span>
+          <p data-heed="c-intro" data-heed-label="Answer">Short answer: Roadrunner Fitting. Here is what the sensor data shows.</p>
+          <ol class="claims">
+            <li class="claim" data-heed="c-claim-night" data-heed-kind="claim" data-heed-cites="c-src-hourly" data-heed-label="Claim: night">
+              <span>Readings peak between 22:00 and 04:00.<span class="ref">1</span></span>
+              <span class="state" id="st-c-claim-night"></span>
+              <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></li>
+            <li class="claim" data-heed="c-claim-factory" data-heed-kind="claim" data-heed-cites="c-src-share" data-heed-label="Claim: factory">
+              <span>Roadrunner Fitting (B) is the largest single source.<span class="ref">2</span></span>
+              <span class="state" id="st-c-claim-factory"></span>
+              <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></li>
+            <li class="claim" data-heed="c-claim-wind" data-heed-kind="claim" data-heed-cites="c-src-wind,c-src-hourly" data-heed-label="Claim: wind">
+              <span>Night peaks coincide with south-easterly wind.<span class="ref">1</span><span class="ref">3</span></span>
+              <span class="state" id="st-c-claim-wind"></span>
+              <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></li>
+          </ol>
+          <div class="sources">
+            <figure data-heed="c-src-hourly" data-heed-kind="evidence" data-heed-label="Source 1: hourly"><figcaption><span>1</span>Mean reading by hour (ppm)</figcaption><svg class="ch" data-chart="hourly" viewBox="0 0 320 120" role="img" aria-label="Mean reading by hour, highest 22:00 to 04:00"></svg></figure>
+            <figure data-heed="c-src-share" data-heed-kind="evidence" data-heed-label="Source 2: share"><figcaption><span>2</span>Attributed share by factory (%)</figcaption><svg class="ch" data-chart="share" viewBox="0 0 320 120" role="img" aria-label="Attributed share by factory; Indigo Sol (C) largest at 38 percent"></svg></figure>
+            <figure data-heed="c-src-wind" data-heed-kind="evidence" data-heed-label="Source 3: wind"><figcaption><span>3</span>Night hours by wind direction</figcaption><svg class="ch" data-chart="wind" viewBox="0 0 320 120" role="img" aria-label="Night hours by wind direction, mostly south-east"></svg></figure>
+          </div>
+        </div>
+        <div id="thread" class="chat"></div>
+        <div class="composer" data-heed="c-compose" data-heed-kind="input" data-heed-label="Composer">
+          <textarea id="q" aria-label="Message" placeholder="Ask a follow-up, e.g. why Factory B?"></textarea>
+          <div class="composer-row"><span class="stats" id="typing">Typing effort appears after you send</span><button type="button" id="send" class="primary" style="flex:none">Send</button></div>
+        </div>
+      </section>
+
+      <!-- DASHBOARD -->
+      <section id="tab-dash" class="dash" aria-label="Dashboard layout" hidden>
+        <div class="chips" data-heed="d-filters" data-heed-label="Filters">
+          <span class="label">Filters</span>
+          <button type="button" data-heed-action="filter" aria-pressed="true">April</button>
+          <button type="button" data-heed-action="filter" aria-pressed="true">All sensors</button>
+          <button type="button" data-heed-action="filter" aria-pressed="false">Night only</button>
+        </div>
+        <div class="kpis">
+          <div class="kpi" data-heed="d-kpi-peak" data-heed-label="KPI: peak"><small>Peak reading</small><b>3.2 ppm</b><small>02:00–03:00</small></div>
+          <div class="kpi" data-heed="d-kpi-alerts" data-heed-label="KPI: alerts"><small>Alerts this month</small><b>14</b><small>12 in March</small></div>
+          <div class="kpi" data-heed="d-kpi-sensors" data-heed-label="KPI: sensors"><small>Sensors reporting</small><b>9 of 9</b><small>no gaps</small></div>
+        </div>
+        <div class="insight" data-heed="d-insight" data-heed-label="AI insight">
+          <span class="who">AI insight</span>
+          <div class="claim" data-heed="d-claim-source" data-heed-kind="claim" data-heed-cites="d-share,d-wind" data-heed-label="Claim: source">
+            <span>Indigo Sol (C) drives the night peaks: largest share, upwind at night.</span>
+            <span class="state" id="st-d-claim-source"></span>
+            <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></div>
+          <div class="claim" data-heed="d-claim-alerts" data-heed-kind="claim" data-heed-cites="d-trend" data-heed-label="Claim: alerts">
+            <span>Weekly alerts have doubled since March.</span>
+            <span class="state" id="st-d-claim-alerts"></span>
+            <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></div>
+        </div>
+        <div class="charts">
+          <figure data-heed="d-hourly" data-heed-kind="evidence" data-heed-label="Chart: hourly"><figcaption><span>hourly</span>Mean reading by hour (ppm)</figcaption><svg class="ch" data-chart="hourly" viewBox="0 0 320 120" role="img" aria-label="Mean reading by hour"></svg></figure>
+          <figure data-heed="d-share" data-heed-kind="evidence" data-heed-label="Chart: share"><figcaption><span>share</span>Attributed share by factory (%)</figcaption><svg class="ch" data-chart="share" viewBox="0 0 320 120" role="img" aria-label="Attributed share by factory"></svg></figure>
+          <figure data-heed="d-wind" data-heed-kind="evidence" data-heed-label="Chart: wind"><figcaption><span>wind</span>Night hours by wind direction</figcaption><svg class="ch" data-chart="wind" viewBox="0 0 320 120" role="img" aria-label="Night hours by wind direction"></svg></figure>
+          <figure data-heed="d-trend" data-heed-kind="evidence" data-heed-label="Chart: alerts"><figcaption><span>alerts</span>Alerts per week, Feb–Apr</figcaption><svg class="ch" data-chart="trend" viewBox="0 0 320 120" role="img" aria-label="Alerts per week, roughly flat between 2 and 4"></svg></figure>
+        </div>
+      </section>
+    </div>
+
+    <aside class="panel" aria-labelledby="hc-h" data-heed-ignore>
+      <h2 id="hc-h">heed <small id="who-id"></small></h2>
+      <div class="field"><span class="label">Purpose</span>
+        <div class="seg" id="purpose"><button type="button" data-v="reflect">Reflect</button><button type="button" data-v="verify">Verify</button><button type="button" data-v="sample">Sample</button><button type="button" data-v="coordinate">Coordinate</button></div></div>
+      <div class="field"><span class="label">Who</span>
+        <div class="seg" id="who"><button type="button" data-v="self">Self</button><button type="button" data-v="peers">Peers</button><button type="button" data-v="all">All</button></div></div>
+      <div class="field"><span class="label">When</span>
+        <div class="seg" id="when"><button type="button" data-v="live">Session</button><button type="button" data-v="30000">Last 30 s</button></div></div>
+      <div class="field"><span class="label">Level</span>
+        <div class="seg" id="level"><button type="button" data-v="debug">debug</button><button type="button" data-v="info">info</button><button type="button" data-v="notice">notice</button><button type="button" data-v="warn">warn</button></div></div>
+      <div class="field" id="face-field" hidden><span class="label">Face</span>
+        <div class="face"><canvas id="mesh" width="240" height="180" aria-label="Camera preview with face mesh"></canvas><dl id="face-dl"></dl></div></div>
+      <div class="field"><span class="label">Findings at or above level</span><div class="log" id="log"></div></div>
+      <details><summary>Spec</summary><pre id="spec"></pre></details>
+      <div class="actions"><button type="button" id="copy">Copy session JSON</button><button type="button" id="reset">Reset</button><span class="state" id="copied"></span></div>
+      <p class="empty">Open the page in a second tab to see peers.</p>
+    </aside>
+  </div>
+
+  <section class="panel" aria-labelledby="mx-h" data-heed-ignore>
+    <h2 id="mx-h">Dwell and transitions <small>regions in the current layout · follows Who and When</small></h2>
+    <div id="mx"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="tr-h" data-heed-ignore>
+    <h2 id="tr-h">Event trails <small>last 60 s · your session</small></h2>
+    <div class="lanes"><canvas id="lanes" aria-label="Swimlanes of attention events over the last 60 seconds"></canvas></div>
+    <p class="empty">Blue is cursor, views, fixations and typing; pink is gaze; orange is time away, idle or flagged. Dots in the bottom row are findings.</p>
+  </section>
+</div>
+
+<div class="gaze-dot" id="dot" hidden data-heed-ignore></div>
+<div class="hud" id="hud" hidden data-heed-ignore><canvas id="hud-mesh" width="120" height="90" aria-hidden="true"></canvas><div id="hud-text"></div></div>
+
+<script src="heed.js"></script>
+<script>
+(function () {
+  // ---------- charts (demo data)
+  var NS = 'http://www.w3.org/2000/svg';
+  var DATA = {
+    hourly: { labels: Array.from({ length: 24 }, function (_, i) { return i % 4 === 0 ? String(i).padStart(2, '0') : ''; }),
+              values: [3.1,2.9,3.0,2.7,2.2,1.4,0.9,0.8,0.7,0.8,0.9,0.8,0.7,0.8,0.9,1.0,1.1,1.2,1.4,1.6,1.9,2.4,2.8,3.2], hi: [0,1,2,3,22,23] },
+    share:  { labels: ['A Kasios', 'B Roadrunner', 'C Indigo', 'D Haghes'], values: [17, 29, 38, 16], hi: [2], unit: '%' },
+    wind:   { labels: ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'], values: [4, 6, 9, 31, 12, 5, 3, 2], hi: [3] },
+    trend:  { line: true, labels: ['Feb', '', '', '', 'Mar', '', '', '', 'Apr', '', '', ''], values: [3, 2, 4, 3, 3, 2, 4, 3, 3, 4, 3, 4] }
+  };
+  function el(n, a) { var e = document.createElementNS(NS, n); for (var k in a) e.setAttribute(k, a[k]); return e; }
+  function draw(svg, d) {
+    var W = 320, H = 120, L = 6, B = 18, T = 14, max = Math.max.apply(null, d.values) * (d.line ? 1.4 : 1), w = (W - L * 2) / d.values.length;
+    var y = function (v) { return H - B - (v / max) * (H - B - T); };
+    if (d.line) {
+      svg.appendChild(el('polyline', { points: d.values.map(function (v, i) { return (L + i * w + w / 2) + ',' + y(v); }).join(' '), fill: 'none', stroke: 'var(--bar-hi)', 'stroke-width': 2 }));
+      d.values.forEach(function (v, i) { svg.appendChild(el('circle', { cx: L + i * w + w / 2, cy: y(v), r: 2.5, fill: 'var(--bar-hi)' })); });
+    }
+    d.values.forEach(function (v, i) {
+      var x = L + i * w;
+      if (!d.line) svg.appendChild(el('rect', { x: x + w * .15, y: y(v), width: w * .7, height: H - B - y(v), rx: 1.5, fill: d.hi.indexOf(i) >= 0 ? 'var(--bar-hi)' : 'var(--bar)' }));
+      if (d.labels[i]) { var t = el('text', { x: x + w / 2, y: H - 5, 'text-anchor': 'middle' }); t.textContent = d.labels[i]; svg.appendChild(t); }
+      if (d.unit) { var n = el('text', { x: x + w / 2, y: y(v) - 3, 'text-anchor': 'middle' }); n.textContent = v + d.unit; svg.appendChild(n); }
+    });
+  }
+  document.querySelectorAll('svg.ch').forEach(function (s) { draw(s, DATA[s.getAttribute('data-chart')]); });
+
+  // ---------- heed
+  function $(x) { return document.getElementById(x); }
+  var h = heed.create({ spec: { purpose: 'verify' } });
+  window.heedInstance = h;
+  $('who-id').textContent = h.self.id;
+  var ui = { purpose: 'verify', who: null, when: 'live', level: null };
+
+  function currentSpec() {
+    var s = { purpose: ui.purpose };
+    if (ui.who) s.who = ui.who;
+    if (ui.level) s.level = ui.level;
+    if (ui.when !== 'live') s.when = { last: Number(ui.when) };
+    s.render = { overlay: $('show').checked, trail: $('trail').checked, links: $('links').checked, toasts: $('notify').checked };
+    if (window.__extraSpec) Object.assign(s, window.__extraSpec());
+    return s;
+  }
+  function apply() {
+    var declared = currentSpec();
+    h.set(declared);
+    var eff = h.spec;
+    ui.who = eff.who; ui.level = eff.level;
+    ['purpose', 'who', 'when', 'level'].forEach(function (k) {
+      var val = k === 'when' ? ui.when : k === 'purpose' ? ui.purpose : eff[k];
+      document.querySelectorAll('#' + k + ' button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.v === String(val))); });
+    });
+    $('spec').textContent = JSON.stringify(declared, null, 2) + '\n// resolves to: who ' + eff.who + ' · level ' + eff.level +
+      ' · signals [' + eff.signals.join(', ') + '] · checks [' + eff.checks.join(', ') + '] · ask ' + (eff.ask ? 'on ' + eff.ask.on : 'off') + ' · notify ' + eff.notify;
+    render();
+  }
+  window.applySpec = apply;
+  ['purpose', 'who', 'when', 'level'].forEach(function (k) {
+    $(k).addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      if (k === 'purpose') { ui.purpose = b.dataset.v; ui.who = null; ui.level = null; } else ui[k] = b.dataset.v;
+      apply();
+    });
+  });
+  ['show', 'trail', 'links', 'notify'].forEach(function (k) { $(k).addEventListener('change', apply); });
+
+  // layout tabs
+  $('layout').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    document.querySelectorAll('#layout button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+    $('tab-chat').hidden = b.dataset.v !== 'chat'; $('tab-dash').hidden = b.dataset.v !== 'dash';
+    h.flush();
+  });
+  // dashboard filter chips toggle
+  document.querySelectorAll('.chips button').forEach(function (b) {
+    b.addEventListener('click', function () { b.setAttribute('aria-pressed', String(b.getAttribute('aria-pressed') !== 'true')); });
+  });
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function render() {
+    var fs = h.query(h.spec).findings().slice(-40).reverse();
+    $('log').innerHTML = fs.length ? fs.map(function (f) {
+      return '<div class="f"><span class="pill ' + f.level + '">' + f.level + '</span><span>' + esc(f.text || f.type) + '</span></div>';
+    }).join('') : '<p class="empty">Nothing at this level yet. Accept a claim, revisit a chart or pause for 10 s.</p>';
+  }
+  h.on('finding', render);
+  setInterval(render, 1000);
+
+  h.on('event:action', function (ev) {
+    if (ev.remote || (ev.action !== 'accept' && ev.action !== 'flag')) return;
+    var s = $('st-' + ev.region); if (!s) return;
+    s.textContent = ev.action === 'accept' ? 'Accepted' : 'Flagged';
+    s.className = 'state ' + (ev.action === 'accept' ? 'accepted' : 'flagged');
+  });
+  h.on('event:typing', function (ev) {
+    if (ev.remote) return;
+    $('typing').innerHTML = '<span><b>' + ev.keys + '</b> keys</span><span><b>' + ev.backspaces + '</b> corrections</span><span><b>' + ev.pauses + '</b> pauses</span><span><b>' + ev.meanIKI + '</b> ms/key</span>';
+  });
+
+  // composer: send adds a turn with a reply that cites a source
+  var turn = 0;
+  $('send').addEventListener('click', function () {
+    var text = $('q').value.trim(); if (!text) return;
+    turn++;
+    var u = document.createElement('div'); u.className = 'msg user'; u.setAttribute('data-heed', 'c-q' + turn); u.setAttribute('data-heed-label', 'Follow-up ' + turn); u.textContent = text;
+    var a = document.createElement('div'); a.className = 'msg ai'; a.setAttribute('data-heed', 'c-a' + turn); a.setAttribute('data-heed-label', 'Reply ' + turn);
+    a.innerHTML = '<span class="who">Assistant</span><p>Source 2 is the one to check: it attributes the largest share to Indigo Sol (C) at 38%, ahead of Roadrunner (B) at 29%. My earlier claim about Factory B does not match it.</p>';
+    $('thread').appendChild(u); $('thread').appendChild(a);
+    $('q').value = ''; $('q').blur();
+  });
+
+  $('copy').addEventListener('click', function () {
+    var text = heed.serialize(h.export());
+    var done = function () { $('copied').textContent = 'Copied ' + h.export().events.length + ' events'; };
+    var fallback = function () { $('spec').textContent = text; $('spec').closest('details').open = true; $('copied').textContent = 'Clipboard blocked; JSON is under Spec. Select and copy it.'; };
+    try { navigator.clipboard.writeText(text).then(done, fallback); } catch (e) { fallback(); }
+  });
+  $('reset').addEventListener('click', function () { h.destroy(); location.reload(); });
+
+  heed.timeline(h, $('lanes'));
+  heed.matrix(h, $('mx'));
+  apply();
+})();
+</script>
+<script type="module">
+import { attachFace } from './heed-face.js';
+const h = window.heedInstance;
+const $ = id => document.getElementById(id);
+const face = attachFace(h, { fps: 15 });
+window.face = face;
+document.querySelectorAll('.cam-only').forEach(el => { el.hidden = false; });
+$('cam-state').textContent = 'Camera off · cursor, scroll, typing and actions';
+
+window.__extraSpec = () => (face.state.calibrated && face.state.status === 'running') ? { signals: ['gaze', 'dwell'] } : {};
+$('show').addEventListener('change', () => paint());
+$('cam').addEventListener('click', async () => {
+  if (face.state.status === 'running') face.stop(); else await face.start();
+  window.applySpec(); paint();
+});
+$('calib').addEventListener('click', async () => {
+  const ok = await face.calibrate();
+  $('cam-state').textContent = ok ? 'Gaze calibrated' : 'Calibration cancelled or no face found; try again in even light';
+  window.applySpec(); paint();
+});
+
+function paint() {
+  const st = face.state, on = st.status === 'running', show = $('show').checked;
+  $('cam').textContent = on ? 'Stop camera' : st.status === 'loading' ? 'Starting…' : 'Start camera';
+  $('cam').classList.toggle('primary', !on);
+  $('calib').disabled = !on;
+  $('face-field').hidden = !on;
+  $('hud').hidden = !(on && show);
+  $('dot').hidden = !(on && show && st.gaze && st.gaze.onScreen);
+  if (st.status === 'error') $('cam-state').textContent = st.error;
+  else if (st.status === 'loading') $('cam-state').textContent = 'Loading the face model (13 MB, once)…';
+  else if (on) $('cam-state').textContent = st.calibrated ? 'Camera on · gaze calibrated' : 'Camera on · calibrate to add gaze';
+}
+function drawMesh(canvas, st) {
+  const c = canvas.getContext('2d'), W = canvas.width, H = canvas.height, v = face.video;
+  c.save(); c.clearRect(0, 0, W, H); c.translate(W, 0); c.scale(-1, 1);
+  if (v && v.readyState >= 2) { c.globalAlpha = 0.55; c.drawImage(v, 0, 0, W, H); c.globalAlpha = 1; }
+  if (st.landmarks) {
+    c.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2563eb';
+    const r = W > 160 ? 1.1 : 0.8;
+    for (let i = 0; i < st.landmarks.length; i += (i >= 468 ? 1 : 2)) { const p = st.landmarks[i]; c.fillRect(p.x * W - r, p.y * H - r, r * 2, r * 2); }
+  }
+  c.restore();
+}
+const pct = x => `<span class="meter"><i style="width:${Math.round(x * 100)}%"></i></span>${x.toFixed(2)}`;
+let lastText = 0;
+face.onFrame(st => {
+  paint();
+  if (st.gaze && $('show').checked) $('dot').style.transform = `translate(${st.gaze.x}px, ${st.gaze.y}px)`;
+  drawMesh($('mesh'), st);
+  if (!$('hud').hidden) drawMesh($('hud-mesh'), st);
+  const t = performance.now(); if (t - lastText < 200) return; lastText = t;
+  const p = st.pose, e = st.expr;
+  $('face-dl').innerHTML = st.present ? `
+    <dt>Face</dt><dd>found · ${st.fps} fps</dd>
+    <dt>Yaw · pitch · roll</dt><dd>${p.yaw.toFixed(0)}° · ${p.pitch.toFixed(0)}° · ${p.roll.toFixed(0)}°</dd>
+    <dt>Smile</dt><dd>${pct(e.smile)}</dd><dt>Brow down</dt><dd>${pct(e.browDown)}</dd><dt>Brow raise</dt><dd>${pct(e.browUp)}</dd><dt>Jaw open</dt><dd>${pct(e.jawOpen)}</dd>
+    <dt>Blinks</dt><dd>${st.blinks} · ${st.blinkRate}/min</dd>
+    <dt>Gaze</dt><dd>${st.calibrated ? (st.gaze ? Math.round(st.gaze.x) + ', ' + Math.round(st.gaze.y) + ' px' : 'eyes closed') : 'not calibrated'}</dd>`
+    : `<dt>Face</dt><dd>not in view · ${st.fps} fps</dd>`;
+  $('hud-text').innerHTML = st.present
+    ? `<b>${p.yaw.toFixed(0)}° ${p.pitch.toFixed(0)}°</b> head<br>smile ${e.smile.toFixed(2)} · brow ${e.browDown.toFixed(2)}<br>${st.blinkRate}/min blinks${st.calibrated ? '' : '<br>gaze: calibrate'}`
+    : '<b>no face</b><br>look at the screen';
+});
+paint();
+</script>
+</body>
+</html>
