@@ -130,15 +130,30 @@ dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant
 .hud canvas { width: 80px; height: 60px; border-radius: 6px; background: var(--soft); flex: none; }
 .hud b { color: var(--fg); font-weight: 600; }
 @media (max-width: 700px) { .face { grid-template-columns: minmax(0, 1fr); } .face canvas { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
+.rec { display: inline-flex; align-items: center; gap: 7px; }
+.rec-dot { width: 9px; height: 9px; border-radius: 50%; background: #dc2626; box-shadow: 0 0 0 3px color-mix(in srgb, #dc2626 25%, transparent); animation: rec 1.6s ease-in-out infinite; }
+.rec[aria-pressed="false"] .rec-dot { background: var(--muted); box-shadow: none; animation: none; }
+@keyframes rec { 50% { opacity: .35; } }
+body.paused .main .panel:first-child { opacity: .6; }
+select { font: inherit; font-size: 13px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); color: var(--fg); padding: 5px 8px; max-width: 100%; }
+.llm-only { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.summary { border: 1px solid var(--accent-line); background: var(--accent-soft); border-radius: 8px; padding: 12px 14px; max-width: 78ch; white-space: pre-wrap; line-height: 1.55; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.fact { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; min-width: 0; align-content: start; }
+.fact h3 { margin: 0; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.fact ul { margin: 0; padding-left: 18px; display: grid; gap: 3px; font-size: 13px; align-content: start; }
+.fact .bad { color: var(--warn); } .fact .ok { color: var(--ok); }
+.expr-row { display: flex; gap: 6px; align-items: center; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>heed <span>playground · 0.4</span></h1>
+    <h1>heed <span>playground · 0.5</span></h1>
     <p class="sub">Two layouts with AI output that cites its evidence. Read, check and accept or flag claims as you normally would. heed captures cursor, scroll, typing, actions and, with the camera on, face and gaze, then shows coverage, your path, transitions between regions and the behaviours it names.</p>
     <div class="toolbar" data-heed-ignore>
+      <button type="button" id="rec" class="rec" aria-pressed="true"><span class="rec-dot" aria-hidden="true"></span><span id="rec-label">Recording</span></button>
       <div class="seg" id="layout" role="tablist" aria-label="Layout"><button type="button" data-v="chat" aria-pressed="true">Chat</button><button type="button" data-v="dash" aria-pressed="false">Dashboard</button></div>
       <span class="sep" aria-hidden="true"></span>
       <label class="switch"><input type="checkbox" id="show" checked> Coverage</label>
@@ -161,15 +176,15 @@ dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant
           <span class="who">Assistant</span>
           <p data-heed="c-intro" data-heed-label="Answer">Short answer: Roadrunner Fitting. Here is what the sensor data shows.</p>
           <ol class="claims">
-            <li class="claim" data-heed="c-claim-night" data-heed-kind="claim" data-heed-cites="c-src-hourly" data-heed-label="Claim: night">
+            <li class="claim" data-heed="c-claim-night" data-heed-truth="true" data-heed-kind="claim" data-heed-cites="c-src-hourly" data-heed-label="Claim: night">
               <span>Readings peak between 22:00 and 04:00.<span class="ref">1</span></span>
               <span class="state" id="st-c-claim-night"></span>
               <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></li>
-            <li class="claim" data-heed="c-claim-factory" data-heed-kind="claim" data-heed-cites="c-src-share" data-heed-label="Claim: factory">
+            <li class="claim" data-heed="c-claim-factory" data-heed-truth="false" data-heed-kind="claim" data-heed-cites="c-src-share" data-heed-label="Claim: factory">
               <span>Roadrunner Fitting (B) is the largest single source.<span class="ref">2</span></span>
               <span class="state" id="st-c-claim-factory"></span>
               <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></li>
-            <li class="claim" data-heed="c-claim-wind" data-heed-kind="claim" data-heed-cites="c-src-wind,c-src-hourly" data-heed-label="Claim: wind">
+            <li class="claim" data-heed="c-claim-wind" data-heed-truth="true" data-heed-kind="claim" data-heed-cites="c-src-wind,c-src-hourly" data-heed-label="Claim: wind">
               <span>Night peaks coincide with south-easterly wind.<span class="ref">1</span><span class="ref">3</span></span>
               <span class="state" id="st-c-claim-wind"></span>
               <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></li>
@@ -202,11 +217,11 @@ dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant
         </div>
         <div class="insight" data-heed="d-insight" data-heed-label="AI insight">
           <span class="who">AI insight</span>
-          <div class="claim" data-heed="d-claim-source" data-heed-kind="claim" data-heed-cites="d-share,d-wind" data-heed-label="Claim: source">
+          <div class="claim" data-heed="d-claim-source" data-heed-truth="true" data-heed-kind="claim" data-heed-cites="d-share,d-wind" data-heed-label="Claim: source">
             <span>Indigo Sol (C) drives the night peaks: largest share, upwind at night.</span>
             <span class="state" id="st-d-claim-source"></span>
             <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></div>
-          <div class="claim" data-heed="d-claim-alerts" data-heed-kind="claim" data-heed-cites="d-trend" data-heed-label="Claim: alerts">
+          <div class="claim" data-heed="d-claim-alerts" data-heed-truth="false" data-heed-kind="claim" data-heed-cites="d-trend" data-heed-label="Claim: alerts">
             <span>Weekly alerts have doubled since March.</span>
             <span class="state" id="st-d-claim-alerts"></span>
             <span class="btns"><button type="button" data-heed-action="flag">Flag</button><button type="button" class="primary" data-heed-action="accept">Accept</button></span></div>
@@ -242,6 +257,20 @@ dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant
   <section class="panel" aria-labelledby="mx-h" data-heed-ignore>
     <h2 id="mx-h">Dwell and transitions <small>regions in the current layout · follows Who and When</small></h2>
     <div id="mx"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="rp-h" data-heed-ignore>
+    <h2 id="rp-h">Session report <small>facts first; the summary is written from them</small></h2>
+    <div class="actions">
+      <button type="button" id="build" class="primary">Build report</button>
+      <span class="llm-only" hidden>
+        <select id="llm-size" aria-label="Summary model"><option value="small">Small model · fastest, phone-friendly</option><option value="medium">Medium model · better prose, larger download</option></select>
+        <button type="button" id="summarize" disabled>Summarize on this device</button>
+      </span>
+      <span class="state" id="llm-status"></span>
+    </div>
+    <div id="summary" class="summary" hidden></div>
+    <div id="facts" class="facts"><p class="empty">Use the layouts for a minute, then build the report. It counts what happened: focus, claim checks, idle time, expressions and typing.</p></div>
   </section>
 
   <section class="panel" aria-labelledby="tr-h" data-heed-ignore>
@@ -375,6 +404,46 @@ dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant
   });
   $('reset').addEventListener('click', function () { h.destroy(); location.reload(); });
 
+  // recording on/off
+  function paintRec() {
+    var on = h.recording;
+    $('rec').setAttribute('aria-pressed', String(on));
+    $('rec-label').textContent = on ? 'Recording' : 'Paused · tap to resume';
+    document.body.classList.toggle('paused', !on);
+  }
+  $('rec').addEventListener('click', function () { if (h.recording) h.pause(); else h.resume(); paintRec(); });
+  paintRec();
+
+  // factual report
+  function li(s) { return '<li>' + s + '</li>'; }
+  function card(title, items) { return '<div class="fact"><h3>' + title + '</h3><ul>' + (items.length ? items.join('') : li('<span class="state">nothing recorded</span>')) + '</ul></div>'; }
+  window.buildReport = function () {
+    var r = heed.report(h); window.lastReport = r;
+    var a = r.attention, s = r.session;
+    var focus = a.regions.slice(0, 5).map(function (x) { return li(esc(x.region) + ': ' + x.seconds + ' s (' + x.share + '%), ' + x.visits + '×'); });
+    if (a.neverAttended.length) focus.push(li('<span class="bad">Never attended:</span> ' + esc(a.neverAttended.join(', '))));
+    var moves = a.topMovesBetweenRegions.map(function (m) { return li(esc(m.from) + ' → ' + esc(m.to) + ' (' + m.count + ')'); })
+      .concat(a.mostRefixated.map(function (m) { return li(esc(m.region) + ' ↺ ' + m.refixations + ' refixations'); }));
+    var claims = r.claims.map(function (c) {
+      var ev = c.evidence.map(function (e) { return esc(e.source) + ' ' + e.seconds + ' s'; }).join(', ');
+      var bad = c.action === 'accepted' && c.claimContradictsEvidence;
+      return li('<span class="' + (bad ? 'bad' : c.action === 'flagged' && c.claimContradictsEvidence ? 'ok' : '') + '">' + c.action + '</span> ' + esc(c.claim) +
+        (c.checked ? ' · evidence ' + c.checked : '') + (ev ? ' (' + ev + ')' : '') + (c.claimContradictsEvidence ? ' · <b>claim contradicts its evidence</b>' : ''));
+    });
+    var idle = [li(r.idle.episodes + ' idle periods, ' + r.idle.seconds + ' s' + (r.idle.whileStillLooking ? ' (' + r.idle.whileStillLooking + ' while still looking)' : '')),
+      li('Looked away ' + r.idle.lookedAway.episodes + '×, ' + r.idle.lookedAway.seconds + ' s'), li('Left the page ' + r.idle.leftPage.episodes + '×, ' + r.idle.leftPage.seconds + ' s')];
+    var ex = r.expressions.map(function (e) { return li(esc(e.expression) + ' (' + esc(e.possibleMeaning) + '): ' + e.seconds + ' s in ' + e.episodes + ' episodes' + (e.mostlyOn.length ? ', on ' + esc(e.mostlyOn.join(', ')) : '')); });
+    if (!s.camera) ex = [li('<span class="state">Camera was off, so no expressions</span>')];
+    var typing = r.typing ? [li(r.typing.messages + ' messages, ' + r.typing.keys + ' keys, ' + r.typing.corrections + ' corrections, ' + r.typing.pauses + ' pauses, ' + r.typing.meanMsBetweenKeys + ' ms between keys')] : [];
+    var sess = [li(s.recordedMinutes + ' min recorded of ' + s.minutes + ' (' + s.pausedSeconds + ' s paused)'), li('Attention from ' + s.attentionSource)];
+    if (r.calibration) sess.push(li('Gaze calibration: ' + (r.calibration.validationErrorPx || r.calibration.meanErrorPx) + ' px error, ' + r.calibration.samples + ' samples'));
+    $('facts').innerHTML = card('Session', sess) + card('Focus', focus) + card('Moves', moves) + card('Claims', claims) + card('Idle and away', idle) + card('Expressions', ex) + (typing.length ? card('Typing', typing) : '') +
+      '<details class="fact"><summary>Raw facts (JSON)</summary><pre>' + esc(JSON.stringify(r, null, 2)) + '</pre></details>';
+    var sb = $('summarize'); if (sb) sb.disabled = false;
+    return r;
+  };
+  $('build').addEventListener('click', function () { window.buildReport(); });
+
   heed.timeline(h, $('lanes'));
   heed.matrix(h, $('mx'));
   apply();
@@ -382,14 +451,29 @@ dt { color: var(--muted); } dd { margin: 0; font: 12px var(--mono); font-variant
 </script>
 <script type="module">
 import { attachFace } from './heed-face.js';
+import { summarize, gpuInfo } from './heed-llm.js';
 const h = window.heedInstance;
 const $ = id => document.getElementById(id);
 const face = attachFace(h, { fps: 15 });
 window.face = face;
-document.querySelectorAll('.cam-only').forEach(el => { el.hidden = false; });
+document.querySelectorAll('.cam-only, .llm-only').forEach(el => { el.hidden = false; });
+if (matchMedia('(pointer: fine)').matches) $('llm-size').value = 'medium';
+gpuInfo().then(g => { if (!g.ok) { $('summarize').disabled = true; $('summarize').title = g.reason; $('llm-status').textContent = g.reason; } });
+let busy = false;
+$('summarize').addEventListener('click', async () => {
+  if (busy) return; busy = true; $('summarize').disabled = true;
+  const r = window.lastReport || window.buildReport();
+  const out = $('summary'); out.hidden = false; out.textContent = '';
+  try {
+    await summarize(r, { size: $('llm-size').value,
+      onStatus: (txt, p) => { $('llm-status').textContent = txt; },
+      onText: txt => { out.innerHTML = txt.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>'); } });
+  } catch (e) { $('llm-status').textContent = 'Summary unavailable: ' + (e && e.message || e); if (!out.textContent) out.hidden = true; }
+  busy = false; $('summarize').disabled = false;
+});
 $('cam-state').textContent = 'Camera off · cursor, scroll, typing and actions';
 
-window.__extraSpec = () => (face.state.calibrated && face.state.status === 'running') ? { signals: ['gaze', 'dwell'] } : {};
+window.__extraSpec = () => face.state.calibrated ? { signals: ['gaze', 'dwell'] } : {};
 $('show').addEventListener('change', () => paint());
 $('cam').addEventListener('click', async () => {
   if (face.state.status === 'running') face.stop(); else await face.start();
@@ -437,11 +521,13 @@ face.onFrame(st => {
     <dt>Face</dt><dd>found · ${st.fps} fps</dd>
     <dt>Yaw · pitch · roll</dt><dd>${p.yaw.toFixed(0)}° · ${p.pitch.toFixed(0)}° · ${p.roll.toFixed(0)}°</dd>
     <dt>Smile</dt><dd>${pct(e.smile)}</dd><dt>Brow down</dt><dd>${pct(e.browDown)}</dd><dt>Brow raise</dt><dd>${pct(e.browUp)}</dd><dt>Jaw open</dt><dd>${pct(e.jawOpen)}</dd>
+    <dt>Expression</dt><dd><b>${st.expression.label}</b>${st.expression.meaning ? ' · ' + st.expression.meaning : ''}</dd>
     <dt>Blinks</dt><dd>${st.blinks} · ${st.blinkRate}/min</dd>
-    <dt>Gaze</dt><dd>${st.calibrated ? (st.gaze ? Math.round(st.gaze.x) + ', ' + Math.round(st.gaze.y) + ' px' : 'eyes closed') : 'not calibrated'}</dd>`
+    <dt>Gaze</dt><dd>${st.calibrated ? (st.gaze ? Math.round(st.gaze.x) + ', ' + Math.round(st.gaze.y) + ' px' : 'eyes closed') : 'not calibrated · or click to teach it'}</dd>
+    <dt>Model</dt><dd>${st.model.samples ? st.model.source + ' · ' + st.model.samples + ' samples · ' + st.model.clicks + ' clicks' + (st.model.validationErrorPx ? ' · ' + st.model.validationErrorPx + ' px' : st.model.cvErrorPx ? ' · ~' + st.model.cvErrorPx + ' px' : '') : 'none yet'}</dd>`
     : `<dt>Face</dt><dd>not in view · ${st.fps} fps</dd>`;
   $('hud-text').innerHTML = st.present
-    ? `<b>${p.yaw.toFixed(0)}° ${p.pitch.toFixed(0)}°</b> head<br>smile ${e.smile.toFixed(2)} · brow ${e.browDown.toFixed(2)}<br>${st.blinkRate}/min blinks${st.calibrated ? '' : '<br>gaze: calibrate'}`
+    ? `<b>${p.yaw.toFixed(0)}° ${p.pitch.toFixed(0)}°</b> head<br>smile ${e.smile.toFixed(2)} · brow ${e.browDown.toFixed(2)}<br>${st.expression.label}${st.calibrated ? '' : '<br>gaze: calibrate or click'}`
     : '<b>no face</b><br>look at the screen';
 });
 paint();

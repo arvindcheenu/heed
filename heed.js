@@ -1,5 +1,5 @@
 /*!
- * heed 0.4.0 — attention-aware toolkit (MVP)
+ * heed 0.5.0 — attention-aware toolkit (MVP)
  * Capture -> Record -> Revisualize for any DOM, driven by one declarative spec:
  *   { who, when, level, purpose }  (+ render / checks / ask knobs)
  * Browser-only signals: pointer dwell, viewport visibility, keystroke dynamics, actions.
@@ -124,8 +124,12 @@
       return Array.prototype.slice.call(scope.querySelectorAll('[data-heed]'));
     }
 
+    var recording = true;
+    var NOOP = { id: null };
     function record(e) {
+      if (!recording && !(e && e.force)) return NOOP; // paused: nothing is kept
       var ev = merge({ id: uid(), t: now(), who: me.id, session: me.session }, e);
+      delete ev.force;
       events.push(ev);
       bus.emit('event', ev);
       bus.emit('event:' + ev.kind, ev);
@@ -138,6 +142,7 @@
       bus.emit('event', ev);
     }
     function finding(f) {
+      if (!recording) return NOOP;
       var x = merge({ id: uid(), t: now(), who: me.id, level: 'info' }, f);
       findings.push(x);
       bus.emit('finding', x);
@@ -191,21 +196,45 @@
           });
           return { kind: kind, seqs: seqs };
         },
-        // Dwell (ms), visits and region-to-region transition counts, optionally limited to some regions.
+        // Dwell (ms) and visits per region, plus transition counts between consecutive
+        // fixations, so a refixation inside the same region counts as a self-transition (A>A).
+        // Falls back to visits when no fixations exist for the source.
         transitions: function (o) {
           o = o || {};
           var sq = this.sequence(o.src), keep = o.regions || null, counts = {}, dwell = {}, visits = {};
+          var ok = function (r) { return r && (!keep || keep.indexOf(r) >= 0); };
           sq.seqs.forEach(function (seq) {
-            var prev = null;
             seq.forEach(function (v) {
-              if (keep && keep.indexOf(v.region) < 0) return;
+              if (!ok(v.region)) return;
               dwell[v.region] = (dwell[v.region] || 0) + v.ms;
               visits[v.region] = (visits[v.region] || 0) + 1;
-              if (prev && prev !== v.region) { var k = prev + '>' + v.region; counts[k] = (counts[k] || 0) + 1; }
-              prev = v.region;
             });
           });
-          return { kind: sq.kind, counts: counts, dwell: dwell, visits: visits };
+          var srcs = sq.kind === 'gaze' ? ['gaze'] : ['pointer', 'touch'], byWho = {};
+          events.forEach(function (e) {
+            if (e.kind !== 'fixation' || srcs.indexOf(e.src) < 0 || !ok(e.region) || !whoMatch(e, s.who) || !within(e.t, s.when)) return;
+            (byWho[e.who] = byWho[e.who] || []).push(e);
+          });
+          var any = Object.keys(byWho).length > 0;
+          if (any) {
+            Object.keys(byWho).forEach(function (w) {
+              var prev = null;
+              byWho[w].sort(function (p, q) { return p.t - q.t; }).forEach(function (f) {
+                if (prev) { var k = prev + '>' + f.region; counts[k] = (counts[k] || 0) + 1; }
+                prev = f.region;
+              });
+            });
+          } else {
+            sq.seqs.forEach(function (seq) {
+              var prev = null;
+              seq.forEach(function (v) {
+                if (!ok(v.region)) return;
+                if (prev) { var k = prev + '>' + v.region; counts[k] = (counts[k] || 0) + 1; }
+                prev = v.region;
+              });
+            });
+          }
+          return { kind: sq.kind, unit: any ? 'fixations' : 'visits', counts: counts, dwell: dwell, visits: visits };
         }
       };
     }
@@ -214,6 +243,10 @@
       self: me,
       get spec() { return spec; },
       set: function (next) { spec = normalize(next); bus.emit('spec', spec); return instance; },
+      get recording() { return recording; },
+      // Stop and start recording. While paused, adapters keep running but nothing is stored.
+      pause: function () { if (!recording) return instance; bus.emit('flush'); bus.emit('pausing'); record({ kind: 'recording', state: 'paused', force: true }); recording = false; bus.emit('recording', false); return instance; },
+      resume: function () { if (recording) return instance; recording = true; record({ kind: 'recording', state: 'resumed' }); bus.emit('recording', true); return instance; },
       query: view,
       coverage: coverage,
       on: bus.on,
@@ -223,7 +256,7 @@
         return instance;
       },
       export: function () {
-        return { heed: '0.4.0', participant: me.id, session: me.session, started: me.started,
+        return { heed: '0.5.0', participant: me.id, session: me.session, started: me.started,
                  exported: now(), spec: spec, events: events.slice(), findings: findings.slice(), trail: (ctx.trail || []).slice() };
       },
       trail: function () { return (ctx.trail || []).slice(); },
@@ -232,8 +265,14 @@
       destroy: function () { bus.emit('flush'); cleanups.forEach(function (fn) { try { fn(); } catch (e) {} }); cleanups = []; }
     };
 
+    function label(id) {
+      if (!id) return '';
+      var el = (root.querySelector ? root : document).querySelector('[data-heed="' + String(id).replace(/"/g, '') + '"]');
+      return (el && el.getAttribute('data-heed-label')) || id;
+    }
     var ctx = {
-      root: root, self: me, bus: bus, events: events, findings: findings,
+      root: root, self: me, bus: bus, events: events, findings: findings, label: label,
+      get recording() { return recording; },
       get spec() { return spec; },
       record: record, ingest: ingest, finding: finding,
       regionOf: regionOf, regionInfo: regionInfo, regions: regions,
@@ -536,6 +575,7 @@
       var doc = ctx.root.ownerDocument || document, last = {};
       ctx.trail = [];
       ctx.point = function (cx, cy, src) {
+        if (!ctx.recording) return;
         var t = now();
         if (last[src] && t - last[src] < 30) return;
         last[src] = t;
@@ -559,7 +599,7 @@
     setup: function (ctx) {
       var doc = ctx.root.ownerDocument || document;
       var say = function (level, type, text, extra) { return ctx.finding(merge({ level: level, type: type, text: text }, extra || {})); };
-      var visits = {}, skimmed = {}, lastInput = now(), idleOn = false, hiddenAt = 0, hover = null;
+      var visits = {}, skimmed = {}, lastInput = now(), idleOn = false, idleAttentive = null, hiddenAt = 0, hover = null;
       var lastFace = null, exprAt = {}, lastScroll = { y: window.scrollY || 0, t: now() }, fastAt = 0, scrollAt = 0;
       ctx.fixations = []; ctx.focus = null;
 
@@ -605,17 +645,6 @@
           var read = ctx.coverage(ev.region, { who: 'self', when: 'live' });
           if (read < 1500) say('notice', 'quick', 'Accepted ' + ev.region + ' after ' + (read / 1000).toFixed(1) + ' s on the claim itself', { region: ev.region, trigger: ev.id });
         }
-        if (ev.kind === 'face' && ev.present) {
-          var at = ctx.focus && now() - ctx.focus.t < 3000 ? ' while on ' + ctx.focus.region : '';
-          var region = at ? ctx.focus.region : null;
-          [['browDown', 0.45, 'frown', 'Frowned'], ['smile', 0.55, 'smile', 'Smiled'], ['browUp', 0.6, 'surprise', 'Raised brows']].forEach(function (x) {
-            if (ev[x[0]] > x[1] && lastFace && lastFace[x[0]] > x[1] && (!exprAt[x[2]] || now() - exprAt[x[2]] > 8000)) {
-              exprAt[x[2]] = now();
-              say('info', x[2], x[3] + at, { region: region, trigger: ev.id });
-            }
-          });
-          lastFace = ev;
-        }
       });
 
       // hesitation over action controls (mouse)
@@ -639,7 +668,7 @@
 
       // idle, leaving the page, scrolling
       function act() {
-        if (idleOn) { ctx.record({ kind: 'idle', ms: now() - lastInput }); idleOn = false; }
+        if (idleOn) { ctx.record({ kind: 'idle', ms: now() - lastInput, attentive: idleAttentive }); idleOn = false; }
         lastInput = now();
       }
       function scroll() {
@@ -666,7 +695,15 @@
           if (k !== 'pointer' && t - c.seen > 400) endCluster(k);       // touch and gaze end when the stream pauses
           if (t - c.t0 > 8000) { endCluster(k); }
         });
-        if (!doc.hidden && !idleOn && t - lastInput > 10000) { idleOn = true; say('info', 'idle', 'No input for 10 s'); }
+        var idleMs = ctx.spec.idleMs || 10000;
+        if (ctx.calibrating) lastInput = t; // following the calibration dot is attention, not idleness
+        if (!doc.hidden && !idleOn && t - lastInput > idleMs) {
+          idleOn = true;
+          var fs = ctx.faceState;
+          idleAttentive = fs && fs.status === 'running' ? !!fs.present : null;
+          var where = ctx.focus && now() - ctx.focus.t < 15000 ? ' on ' + ctx.label(ctx.focus.region) : '';
+          say('info', 'idle', 'No input for ' + Math.round(idleMs / 1000) + ' s' + (idleAttentive === true ? ', still looking' + where : idleAttentive === false ? ', face not in view' : ''));
+        }
       }, 250);
 
       doc.addEventListener('pointerover', over, true);
@@ -802,6 +839,7 @@
       { name: 'Cursor', kinds: ['dwell'] }, { name: 'Gaze', kinds: ['gaze'] }, { name: 'In view', kinds: ['view'], noLabels: true },
       { name: 'Fixations', kinds: ['fixation'] }, { name: 'Typing', kinds: ['typing'] }, { name: 'Scroll', kinds: ['scroll'] },
       { name: 'Actions', kinds: ['action', 'prompt', 'response', 'calibration'] }, { name: 'Presence', kinds: ['face', 'away', 'hidden', 'idle'] },
+      { name: 'Expression', kinds: ['emotion'] },
       { name: 'Findings', findings: true }
     ];
     var g = canvas.getContext('2d'), timer;
@@ -837,7 +875,8 @@
           var bad = e.kind === 'away' || e.kind === 'hidden' || e.kind === 'idle' || (e.kind === 'face' && !e.present);
           var color = bad ? C.warn : e.kind === 'gaze' || (e.kind === 'fixation' && e.src === 'gaze') ? C.gaze : C.tint;
           if (e.kind === 'face') { blocks.push({ a: e.t - 500, b: e.t, key: bad ? 'away' : 'here', color: color, alpha: bad ? 0.9 : 0.3, thin: true }); return; }
-          if (e.ms) { blocks.push({ a: e.t - e.ms, b: e.t, key: (e.region || '') + '|' + color, region: e.region, color: color, alpha: bad ? 0.8 : 0.5, label: !ln.noLabels }); return; }
+          if (e.kind === 'emotion') color = e.valence === 'negative' ? C.warn : e.valence === 'positive' ? C.tint : C.gaze;
+          if (e.ms) { var nm = e.kind === 'emotion' ? e.label : e.region; blocks.push({ a: e.t - e.ms, b: e.t, key: (nm || '') + '|' + color, region: nm, color: color, alpha: bad ? 0.8 : 0.5, label: !ln.noLabels }); return; }
           var x = X(e.t); if (x < LBL) return;
           g.fillStyle = color; g.fillRect(x - 1, y + 4, 2, LANE - 9);
           if (e.kind === 'action' && e.action) { g.fillStyle = C.fg; g.textAlign = 'left'; g.font = '10px ui-monospace,SFMono-Regular,Menlo,monospace'; g.fillText(e.action, x + 4, mid - 0.5); g.font = '11px system-ui,-apple-system,"Segoe UI",sans-serif'; }
@@ -861,6 +900,18 @@
             g.font = '11px system-ui,-apple-system,"Segoe UI",sans-serif';
           }
         });
+      });
+      // paused recording: shaded band across all lanes
+      var bands = [], pausedAt = null;
+      h.query({ who: 'self', when: 'live', level: 'trace' }).events().forEach(function (e) {
+        if (e.kind !== 'recording') return;
+        if (e.state === 'paused') pausedAt = e.t; else if (pausedAt) { bands.push([pausedAt, e.t]); pausedAt = null; }
+      });
+      if (pausedAt && !h.recording) bands.push([pausedAt, t1]);
+      bands.forEach(function (bd) {
+        var a = Math.max(LBL, X(bd[0])), b = X(bd[1]); if (b < LBL) return;
+        g.globalAlpha = 0.12; g.fillStyle = C.muted; g.fillRect(a, TOP, Math.max(2, b - a), lanes.length * LANE); g.globalAlpha = 1;
+        if (b - a > 50) { g.fillStyle = C.muted; g.textAlign = 'left'; g.font = '10px system-ui,-apple-system,sans-serif'; g.fillText('paused', a + 4, TOP + 8); g.font = '11px system-ui,-apple-system,"Segoe UI",sans-serif'; }
       });
       var ay = TOP + lanes.length * LANE + 10; g.fillStyle = C.muted; g.textAlign = 'center';
       for (var s = 0; s <= win / 1000; s += 10) { var x = X(t1 - s * 1000); g.fillText(s === 0 ? 'now' : '-' + s + ' s', Math.min(W - 14, Math.max(LBL + 10, x)), ay); }
@@ -904,7 +955,16 @@
         var ink = css('--heed-card', '#ffffff'), txt = css('--heed-card-fg', '#09090b');
         keys.forEach(function (k) {
           var ab = k.split('>'), A = pos[ab[0]], B = pos[ab[1]]; if (!A || !B) return;
-          var c = tr.counts[k], f = c / max, dx = B.x - A.x, dy = B.y - A.y, d = Math.hypot(dx, dy) || 1;
+          var c = tr.counts[k], f = c / max;
+          if (ab[0] === ab[1]) { // self-transition: loop at the region's top-right
+            var lx = Math.min(A.r.right - 18, A.x + A.r.width / 2 - 18), ly = A.r.top + 2;
+            g.globalAlpha = 0.25 + 0.6 * f; g.strokeStyle = col; g.lineWidth = 1 + 3 * Math.sqrt(f);
+            g.beginPath(); g.arc(lx, ly, 9, Math.PI * 0.15, Math.PI * 1.85); g.stroke();
+            g.globalAlpha = 1; g.font = '600 10px ui-monospace,SFMono-Regular,Menlo,monospace'; g.textAlign = 'center'; g.textBaseline = 'middle';
+            g.fillStyle = ink; g.beginPath(); g.arc(lx, ly, 7, 0, Math.PI * 2); g.fill(); g.fillStyle = txt; g.fillText(String(c), lx, ly + 0.5);
+            return;
+          }
+          var dx = B.x - A.x, dy = B.y - A.y, d = Math.hypot(dx, dy) || 1;
           var nx = -dy / d, ny = dx / d, bend = Math.min(80, d * 0.18);
           var cx = (A.x + B.x) / 2 + nx * bend, cy = (A.y + B.y) / 2 + ny * bend;
           var tx = B.x - cx, ty = B.y - cy, tl = Math.hypot(tx, ty) || 1, ex = B.x - tx / tl * 10, ey = B.y - ty / tl * 10;
@@ -947,7 +1007,7 @@
         '.heed-mx .num{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:right;color:var(--heed-muted,#71717a)}' +
         '.heed-mx .tm{overflow-x:auto}.heed-mx .tm td,.heed-mx .tm th{width:30px;height:26px;text-align:center;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid var(--heed-line,#e4e4e7)}' +
         '.heed-mx .tm th{font-weight:500;color:var(--heed-muted,#71717a);background:transparent}.heed-mx .tm th.row{text-align:left;width:auto;padding:0 8px;white-space:nowrap;font-family:system-ui,-apple-system,sans-serif}' +
-        '.heed-mx .tm td.diag{background:var(--heed-btn,#fafafa);color:var(--heed-line,#d4d4d8)}' +
+        '.heed-mx .tm td.diag{background:var(--heed-btn,#fafafa);color:var(--heed-muted,#a1a1aa);outline:1.5px solid var(--heed-card-fg,#09090b);outline-offset:-2px}' +
         '.heed-mx .key{margin:8px 0 0;color:var(--heed-muted,#71717a)}.heed-mx .key b{font-weight:600;color:var(--heed-card-fg,#09090b)}.heed-mx .top{margin:0 0 10px}.heed-mx .top b{font-weight:600}' +
         '.heed-mx .empty{color:var(--heed-muted,#71717a);margin:0}';
       doc.head.appendChild(st);
@@ -973,25 +1033,87 @@
       }).join('') + '</tbody></table>' +
         (never.length ? '<p class="key"><b>Never attended (' + never.length + '):</b> ' + never.map(function (id) { return esc(label[id]); }).join(', ') + '</p>' : '<p class="key">Every region in this layout was attended.</p>');
       var keys = Object.keys(tr.counts), maxC = Math.max.apply(null, keys.map(function (k) { return tr.counts[k]; }).concat([1]));
-      var top = keys.sort(function (a, b) { return tr.counts[b] - tr.counts[a]; }).slice(0, 3).map(function (k) {
+      var between = keys.filter(function (k) { var ab = k.split('>'); return ab[0] !== ab[1]; });
+      var selfMoves = keys.filter(function (k) { var ab = k.split('>'); return ab[0] === ab[1]; }).reduce(function (a, k) { return a + tr.counts[k]; }, 0);
+      var top = between.sort(function (a, b) { return tr.counts[b] - tr.counts[a]; }).slice(0, 3).map(function (k) {
         var ab = k.split('>'); return esc(label[ab[0]] || ab[0]) + ' → ' + esc(label[ab[1]] || ab[1]) + ' <b>' + tr.counts[k] + '</b>';
       });
       var n = order.length, head = '<tr><th class="row">from ↓ to →</th>' + order.map(function (_, i) { return '<th>' + (i + 1) + '</th>'; }).join('') + '</tr>';
       var rows = order.map(function (a, i) {
         return '<tr><th class="row">' + (i + 1) + ' ' + esc(label[a]) + '</th>' + order.map(function (b) {
-          if (a === b) return '<td class="diag">·</td>';
           var c = tr.counts[a + '>' + b] || 0, pct = Math.round(15 + 70 * c / maxC);
+          if (a === b) return c ? '<td class="diag self" title="Refixations within ' + esc(label[a]) + '" style="background:color-mix(in srgb,' + tint + ' ' + pct + '%,transparent);color:' + (pct > 55 ? 'var(--heed-card,#fff)' : 'inherit') + '">' + c + '</td>' : '<td class="diag">0</td>';
           return c ? '<td style="background:color-mix(in srgb,' + tint + ' ' + pct + '%,transparent);color:' + (pct > 55 ? 'var(--heed-card,#fff)' : 'inherit') + '">' + c + '</td>' : '<td></td>';
         }).join('') + '</tr>';
       }).join('');
-      el.innerHTML = '<div class="heed-mx"><div><h3>Dwell · ' + src + '</h3>' + dw + '</div><div><h3>Transitions · ' + keys.length + ' kinds, ' +
-        keys.reduce(function (a, k) { return a + tr.counts[k]; }, 0) + ' moves</h3>' + (top.length ? '<p class="top">Most frequent: ' + top.join(' · ') + '</p>' : '') +
-        '<div class="tm"><table><tbody>' + head + rows + '</tbody></table></div><p class="key">Row is where attention left, column is where it went next.</p></div></div>';
+      el.innerHTML = '<div class="heed-mx"><div><h3>Dwell · ' + src + '</h3>' + dw + '</div><div><h3>Transitions between ' + (tr.unit || 'visits') + ' · ' + between.reduce(function (a, k) { return a + tr.counts[k]; }, 0) + ' between regions, ' + selfMoves + ' within</h3>' + (top.length ? '<p class="top">Most frequent: ' + top.join(' · ') + '</p>' : '') +
+        '<div class="tm"><table><tbody>' + head + rows + '</tbody></table></div><p class="key">Row is where attention left, column is where it went next. The outlined diagonal counts refixations inside the same region.</p></div></div>';
       if (n === 0) el.innerHTML = '';
     }
     draw();
     var timer = setInterval(draw, opts.refreshMs || 700);
     return { stop: function () { clearInterval(timer); }, draw: draw };
+  }
+
+  // Report: the session reduced to facts (no interpretation). Used directly, and as the
+  // only input to the optional LLM summary, so the summary cannot invent behaviour.
+  function report(h, opts) {
+    opts = opts || {};
+    var doc = opts.document || document;
+    var ex = h.export(), ev = ex.events.filter(function (e) { return e.who === ex.participant; });
+    var lab = function (id) { var el = doc.querySelector('[data-heed="' + String(id).replace(/"/g, '') + '"]'); return (el && el.getAttribute('data-heed-label')) || id; };
+    var sec = function (ms) { return Math.round(ms / 100) / 10; };
+    var end = Date.now(), paused = 0, pAt = null;
+    ev.forEach(function (e) { if (e.kind === 'recording') { if (e.state === 'paused') pAt = e.t; else if (pAt) { paused += e.t - pAt; pAt = null; } } });
+    if (pAt) paused += end - pAt;
+    var all = Array.prototype.slice.call(doc.querySelectorAll('[data-heed]')).filter(function (el) { return !el.closest('[data-heed-ignore]'); });
+    var ids = all.map(function (el) { return el.getAttribute('data-heed'); });
+    var hasGaze = ev.some(function (e) { return e.kind === 'gaze'; });
+    var v = h.query({ who: 'self', when: 'live', level: 'trace', signals: hasGaze ? ['gaze', 'dwell'] : h.spec.signals });
+    var tr = v.transitions({ regions: ids, src: hasGaze ? 'gaze' : 'dwell' });
+    var total = Object.keys(tr.dwell).reduce(function (a, k) { return a + tr.dwell[k]; }, 0) || 1;
+    var regions = ids.filter(function (id) { return tr.dwell[id]; }).sort(function (a, b) { return tr.dwell[b] - tr.dwell[a]; })
+      .map(function (id) { return { region: lab(id), seconds: sec(tr.dwell[id]), share: Math.round(tr.dwell[id] / total * 100), visits: tr.visits[id] || 0 }; });
+    var never = ids.filter(function (id) { return !tr.dwell[id]; }).map(lab);
+    var moves = Object.keys(tr.counts).map(function (k) { var ab = k.split('>'); return { from: lab(ab[0]), to: lab(ab[1]), count: tr.counts[k], self: ab[0] === ab[1] }; })
+      .sort(function (a, b) { return b.count - a.count; });
+    var unver = {}; ex.findings.forEach(function (f) { if (f.type === 'unverified' && f.trigger) unver[f.trigger] = f; });
+    var claims = ev.filter(function (e) { return e.kind === 'action' && (e.action === 'accept' || e.action === 'flag') && e.region; }).map(function (e) {
+      var el = doc.querySelector('[data-heed="' + e.region + '"]'), truth = el ? el.getAttribute('data-heed-truth') : null, f = unver[e.id];
+      return { claim: lab(e.region), action: e.action === 'accept' ? 'accepted' : 'flagged',
+        evidence: f ? f.cites.map(function (c) { return { source: lab(c.region), seconds: sec(c.ms) }; }) : (e.cites || []).map(function (c) { return { source: lab(c), seconds: sec(h.coverage(c, { who: 'self', when: 'live' })) }; }),
+        checked: f ? (f.level === 'info' ? 'checked' : f.level === 'notice' ? 'glanced' : 'not looked at') : null,
+        claimContradictsEvidence: truth === 'false' ? true : truth === 'true' ? false : null };
+    });
+    var count = function (k) { return ev.filter(function (e) { return e.kind === k; }); };
+    var sum = function (list) { return list.reduce(function (a, e) { return a + (e.ms || 0); }, 0); };
+    var idle = count('idle'), away = count('away'), hidden = count('hidden'), typing = count('typing');
+    var emo = {}; count('emotion').forEach(function (e) {
+      var x = emo[e.label] || (emo[e.label] = { expression: e.label, meaning: e.meaning, seconds: 0, episodes: 0, regions: {} });
+      x.seconds += e.ms / 1000; x.episodes++; if (e.region) x.regions[lab(e.region)] = (x.regions[lab(e.region)] || 0) + e.ms / 1000;
+    });
+    var expressions = Object.keys(emo).map(function (k) {
+      var x = emo[k], top = Object.keys(x.regions).sort(function (a, b) { return x.regions[b] - x.regions[a]; }).slice(0, 2);
+      return { expression: x.expression, possibleMeaning: x.meaning, seconds: sec(x.seconds * 1000), episodes: x.episodes, mostlyOn: top };
+    }).sort(function (a, b) { return b.seconds - a.seconds; });
+    var byType = {}; ex.findings.forEach(function (f) { byType[f.type] = (byType[f.type] || 0) + 1; });
+    var cal = count('calibration').filter(function (e) { return e.ok; }).pop();
+    var answers = count('response').map(function (e) { return { question: e.question, answer: e.answer, region: lab(e.region) }; });
+    return {
+      session: { minutes: Math.round((end - ex.started) / 6000) / 10, recordedMinutes: Math.round((end - ex.started - paused) / 6000) / 10, pausedSeconds: sec(paused),
+                 attentionSource: tr.kind === 'gaze' ? 'camera gaze' : 'cursor dwell', camera: ev.some(function (e) { return e.kind === 'face-start'; }) },
+      attention: { regions: regions, neverAttended: never, topMovesBetweenRegions: moves.filter(function (m) { return !m.self; }).slice(0, 5),
+                   mostRefixated: moves.filter(function (m) { return m.self; }).slice(0, 3).map(function (m) { return { region: m.from, refixations: m.count }; }) },
+      claims: claims,
+      idle: { episodes: idle.length, seconds: sec(sum(idle)), whileStillLooking: idle.filter(function (e) { return e.attentive === true; }).length,
+              lookedAway: { episodes: away.length, seconds: sec(sum(away)) }, leftPage: { episodes: hidden.length, seconds: sec(sum(hidden)) } },
+      expressions: expressions,
+      typing: typing.length ? { messages: typing.length, keys: typing.reduce(function (a, e) { return a + e.keys; }, 0), corrections: typing.reduce(function (a, e) { return a + e.backspaces; }, 0),
+                                pauses: typing.reduce(function (a, e) { return a + e.pauses; }, 0), meanMsBetweenKeys: Math.round(typing.reduce(function (a, e) { return a + e.meanIKI; }, 0) / typing.length) } : null,
+      behaviours: byType,
+      samplingAnswers: answers,
+      calibration: cal ? { meanErrorPx: cal.meanErrorPx, validationErrorPx: cal.validationErrorPx, points: cal.points, samples: cal.samples } : null
+    };
   }
 
   function defaultPlugins() {
@@ -1002,7 +1124,7 @@
   function serialize(data) { return JSON.stringify(data, function (k, v) { return k === 'el' ? undefined : v; }, 2); }
 
   return {
-    version: '0.4.0',
+    version: '0.5.0',
     create: create,
     normalize: normalize,
     serialize: serialize,
@@ -1010,6 +1132,7 @@
     purposes: PURPOSES,
     timeline: timeline,
     matrix: matrix,
+    report: report,
     plugins: { links: links, points: points, behaviors: behaviors, trail: trail, toasts: toasts, pointer: pointer, viewport: viewport, keys: keys, actions: actions,
                unverified: unverified, overlay: overlay, ask: ask, broadcast: broadcast, store: store }
   };

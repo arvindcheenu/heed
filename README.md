@@ -1,90 +1,108 @@
-# heed 0.4 — face, trails, transitions and behaviour
+# heed 0.5
 
-Static site. Open `index.html` over HTTPS (phones only allow the camera on secure pages, or on `localhost`).
+Attention-aware toolkit for any web page, with a playground at **https://heed.arvindchee.nu**. It captures where people attend (cursor, scroll, typing, actions, and with the camera on, face, expression and gaze), records it as events, shows it back on the page, and reduces a session to a factual report that an on-device LLM can narrate.
 
-## Put it on your phone (GitHub Pages, about 3 minutes)
+Everything runs in the browser. Video frames never leave the device or get stored; heed keeps only derived numbers.
 
-1. Create a repo, e.g. `arvindcheenu/heed-demo`, and push this folder's contents to `main`.
-2. Repo → Settings → Pages → Source: "Deploy from a branch", branch `main`, folder `/`.
-3. Open `https://arvindcheenu.github.io/heed-demo/` on the phone, tap **Start camera**, allow the camera, then **Calibrate gaze**.
+## Files
 
-Any static HTTPS host works the same way. Locally on the laptop: `python3 -m http.server` and open `http://localhost:8000`.
+| File | What it is |
+| --- | --- |
+| `heed.js` | Core: kernel, spec, capture plugins, behaviours, renderers, matrices, timeline, report. No dependencies. |
+| `heed-face.js` | Camera plugin: face mesh, head pose, expressions, blinks, calibrated gaze that learns from clicks. |
+| `heed-llm.js` | Optional summary written by a small model running in the browser (WebLLM, WebGPU). |
+| `index.html` | Playground with a chat layout and a dashboard layout. |
+| `vendor/` | MediaPipe Face Landmarker 0.10.14 and model, WebLLM 0.2.85. Apache 2.0. |
 
-## What the camera adds
+## Using the playground
 
-`heed-face.js` runs MediaPipe Face Landmarker (478 landmarks, 52 blendshapes, head transform) entirely on the device. Model and WASM are vendored in `vendor/`, so the page makes no third-party requests. No video frames are stored or sent; heed records only derived numbers.
+1. **Recording** (red dot, top left) pauses and resumes capture. While paused nothing is stored; open gaze dwell and expression episodes are saved at the moment you pause.
+2. **Start camera**, then **Calibrate gaze** (about 50 s on a phone). Hold the device steady.
+3. Read, check and accept or flag claims in **Chat** or **Dashboard**.
+4. Every **click or tap** after the camera starts adds a calibration sample and refits the gaze model. Without the full calibration, clicks alone start gaze after eight samples.
+5. **Build report**, then **Summarize on this device** for a narrative written from the report.
 
-| Event | Fields | Rate |
+Toggles: **Coverage** (tint by attention), **Trail** (path and numbered fixations), **Transitions** (arrows between regions, loops for refixations), **Notify** (toasts for behaviours).
+
+## Gaze calibration
+
+Three phases, then continuous learning:
+
+1. **Grid**: 17 points (4×4 plus centre) in random order. Each point waits 700 ms for the eyes to land, then takes the median of at least 5 frames. Grid samples weigh 3.
+2. **Smooth pursuit**: 14 s of a dot gliding along a Lissajous path; each frame is labelled with where the dot was 150 ms earlier, to allow for eye lag. Weight 1.
+3. **Validation**: 5 fresh points, never used before the error is measured. The result card reports the average error in pixels and as a share of the screen diagonal (good ≤ 8%, fair ≤ 15%).
+4. **Clicks and taps**: each one pairs the median face features from the 250 ms before it with the click position. Weight 2, last 200 kept.
+
+The model is a weighted ridge regression on 22 features (head yaw, pitch, roll and position; iris position in each eye along and across the eye axis; eye openness; face position and size; and second-order terms), with the regularisation picked by 5-fold cross-validation. Expect region-level accuracy on a phone's front camera, best when the head stays near its calibration pose.
+
+## Expressions
+
+MediaPipe gives 52 blendshape scores per frame. heed combines them into five expressions and measures each against **your own neutral face** (learned from your first frames, then from the calibration grid):
+
+| Expression | From | Possible meaning shown |
 | --- | --- | --- |
-| `face` | `present, yaw, pitch, roll` (degrees), `smile, browDown, browUp, jawOpen` (0–1), `blinkRate` (/min), `gx, gy` (px, after calibration) | 2 Hz |
-| `gaze` | `region, ms` — gaze dwell on a `data-heed` region; counts as coverage when `signals` includes `gaze` | on region change |
-| `away` | `ms` — face out of view > 1.5 s; also a `notice` finding | per episode |
-| `calibration` | `ok, points, meanErrorPx` | per run |
-| `face-start` / `face-stop` | | |
+| smiling | mouth smile, cheek raise | positive |
+| brows raised | inner and outer brow raise, eyes wide, jaw | surprise or interest |
+| frowning | brows down, eye squint | concentration or confusion |
+| mouth corners down | mouth frown, lips pressed | doubt or sadness |
+| nose wrinkled | nose sneer, upper lip raise | dislike or disgust |
 
-Gaze is a 9-point ridge regression on head yaw/pitch plus iris position within each eye. On a phone's front camera expect region-level accuracy (roughly a quarter of the screen), better horizontally than vertically, and only while the head stays near its calibration pose. Recalibrate when posture changes.
+These are facial movements. The meaning column is one reading, and the report and summary present it that way. An expression must hold 500 ms to start an episode; episodes of 700 ms or more are recorded as `emotion` events with the region in focus, e.g. "Frowning (concentration or confusion) for 2.4 s on Source 2: share".
 
-**Show attention** toggles only the visible layer (region tint, gaze dot, the floating face readout). Capture continues while it is off. The browser still asks for camera permission and shows its camera indicator; a page cannot suppress either.
+## Idle and away
 
-## The playground
-
-Two layouts share one heed instance: **Chat** (a question, an answer with three cited claims and its sources, and a composer that adds turns) and **Dashboard** (filters, KPI tiles, an AI insight with two cited claims, four charts). One claim in each is false against its own evidence (Factory B in chat; "alerts doubled" on the dashboard), so the unverified check and sampling have something real to catch.
-
-Toolbar toggles map to `render`: **Coverage** (`overlay`), **Trail** (`trail`), **Transitions** (`links`), **Notify** (`toasts`).
+- **Idle**: no input for `spec.idleMs` (default 10 s). With the camera on, heed tells apart idle while still looking (and at what) from idle with the face out of view. Calibration never counts as idle.
+- **Away**: face out of view for over 1.5 s.
+- **Left the page**: tab hidden for over 2 s.
 
 ## Dwell and transitions
 
-`h.query(spec).transitions({ regions })` returns `{ kind, dwell, visits, counts }`: ms and visit count per region, and `"from>to"` move counts. Visits come from gaze when the spec counts gaze and gaze exists, otherwise from cursor dwell; consecutive pieces of one region within 1.5 s merge into one visit, and each person's sequence is counted separately.
+`h.query(spec).transitions({ regions })` returns dwell and visits per region and counts of moves between consecutive **fixations**. A refixation inside the same region counts as a self-transition, so the diagonal of the matrix is filled. The source is gaze when gaze exists, otherwise the cursor. On the page, self-transitions appear as small loops with their count.
 
-- **Transitions over the page** (`render.links`): arrows between the regions' live positions, thicker for more frequent moves, with the count on each arrow.
-- **Matrices** (`heed.matrix(h, el)`): dwell per region (seconds, share, visits), the from → to heatmap, the three most frequent moves, and the regions in the current layout that were never attended.
+## Report and summary
 
-Both follow Who and When, so Peers or Last 30 s change them live.
+`heed.report(h)` returns counted facts: time recorded and paused, dwell and share per region, regions never attended, top moves and refixations, each claim with what happened to its evidence (checked, glanced, not looked at) and whether it contradicts its evidence (`data-heed-truth="false"` on the claim), idle and away time, expressions and where they happened, typing effort, calibration accuracy, and sampling answers.
 
-## Trails and behaviour
+`heed-llm.js` passes only that JSON to a small instruction model in the browser, with instructions to use only those facts and to describe expressions as movements. Models: Qwen2.5 0.5B (default on phones) or 1.5B (default on desktop), in 16-bit form where the GPU supports it, else 32-bit. Weights download once from Hugging Face and stay cached. Needs a browser with WebGPU; without it the page says so and the factual report stands on its own.
 
-**Trail** (`render.trail`) draws the last 15 s of cursor, touch and gaze as a fading path, with fixations as circles sized by duration and numbered in order: a scanpath over the live page. Gaze is pink and cursor blue.
+## The spec
 
-**Notify** (`render.toasts`) pops a short card for each finding at or above `notify` (default `notice`).
-
-**Event trails** (`heed.timeline(h, canvas)`) shows the last 60 s as swimlanes: cursor, gaze, in view, fixations, typing, scroll, actions, presence and findings.
-
-Behaviours detected by the `behaviors` plugin:
-
-| Finding | Level | When |
+| Key | Values | Meaning |
 | --- | --- | --- |
-| `revisit` | info | Back on a region after more than 4 s elsewhere |
-| `skim` | notice | A region was in view under 0.7 s and never looked at or hovered |
-| `quick` | notice | A claim was accepted with under 1.5 s spent on the claim itself |
-| `hesitation` | info / notice | Hovered an action for over 1.2 s, then clicked or moved away |
-| `idle` | info | No input for 10 s |
-| `left` | notice | The page was hidden for over 2 s |
-| `fast-scroll` | debug | Scrolling faster than 2500 px/s |
-| `frown`, `smile`, `surprise` | info | Sustained expression (camera on), tied to the region in focus |
-| `away` | notice | Face out of view over 1.5 s (camera on) |
-| `unverified` | warn / notice / info | Claim accepted without, with a glance at, or after checking its cited evidence |
+| `who` | `self`, `peers`, `all` | Whose attention a view shows |
+| `when` | `live`, `{ last: ms }`, `{ from, to }` | Which interval |
+| `level` | `trace` … `error` | Rendering threshold; producers always run |
+| `purpose` | `reflect`, `verify`, `sample`, `coordinate` | Macro that sets the knobs below |
+| `signals` | e.g. `['gaze','dwell']` | Event kinds that count as coverage |
+| `threshold` | ms, default 800 | Attention needed for evidence to count as checked |
+| `idleMs` | ms, default 10000 | Idle threshold |
+| `render` | `{ overlay, trail, links, toasts }` | What to draw |
+| `notify` | level, default `notice` | Toast threshold |
+| `checks` | `['unverified']` | Checks to run |
+| `ask` | `false` or `{ on, question, options }` | Attention-triggered experience sampling |
 
-Fixations are recorded as `fixation` events (`src, x, y, ms, region`), using a dispersion threshold of 30 px for cursor and 90 px for gaze. `h.export().trail` holds the raw points.
-
-## Using it in your own page
+## API
 
 ```html
 <script src="heed.js"></script>
 <script type="module">
   import { attachFace } from './heed-face.js';
+  import { summarize } from './heed-llm.js';
   const h = heed.create({ spec: { purpose: 'verify' } });
-  const face = attachFace(h, { fps: 15 });
-  startButton.onclick = async () => { await face.start(); await face.calibrate(); h.set({ ...h.spec, signals: ['gaze', 'dwell'] }); };
-  face.onFrame(s => console.log(s.pose, s.expr, s.gaze));
+  const face = attachFace(h);
+  await face.start(); await face.calibrate();
+  h.pause(); h.resume();
+  const facts = heed.report(h);
+  const text = await summarize(facts, { size: 'small', onText: t => console.log(t) });
 </script>
 ```
 
-## Tested
+Mark regions with `data-heed="<id>"` (optional `data-heed-label`, `data-heed-cites`, `data-heed-truth`), actions with `data-heed-action`, and UI to ignore with `data-heed-ignore`.
 
-Headless Chrome on a 390 × 844 phone viewport, with a face video as the camera: camera start and model load from `vendor/`, face found (478 landmarks), head pose and expression, 9-point calibration, gaze driving coverage, gaze trail and gaze dwell, the unverified check, the sampling question, composer typing effort and new turns, the dashboard with gaze matrices, swimlanes, JSON export, and no page errors or failed requests (17 checks). WebKit (Safari's engine) ran the same model on the test face: 478 landmarks, 52 blendshapes, head transform. Desktop Chrome ran the cursor-only path with no errors.
+Events: `dwell`, `view`, `gaze`, `fixation`, `typing`, `scroll`, `action`, `face`, `emotion`, `away`, `hidden`, `idle`, `calibration`, `calibration-click`, `recording`, `prompt`, `response`.
 
-Not tested: a real phone, real eye movement (the test face does not look around, so gaze accuracy is unmeasured), and Firefox.
+## Tested (0.5)
 
-## Third-party
+Headless Chrome on a 390×844 phone viewport with a face video as the camera: camera and model load from `vendor/`, face found (478 landmarks), neutral baseline, full calibration (22 points, pursuit, validation, result card), taps refining the model, pause storing nothing while the camera runs, gaze-based claim check, idle while still looking, a smile detected after a switch from a neutral to a smiling face and recorded with its region, the report using camera gaze, and no page errors or failed requests. Desktop Chrome: pause and resume, self-transitions in data and matrix, report, idle. WebKit (Safari's engine): face model (478 landmarks, 52 blendshapes, head transform) and page interactions. On-device summary: WebLLM with Qwen2.5 0.5B on a software WebGPU adapter.
 
-`vendor/` contains `@mediapipe/tasks-vision` 0.10.14 and the `face_landmarker.task` model (float16, v1) from Google, Apache License 2.0.
+Not tested: a real phone or real eye movement (the test face is a photo, so gaze accuracy is unmeasured here), and Firefox.
