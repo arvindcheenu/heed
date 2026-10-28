@@ -10,6 +10,7 @@
  *   const face = attachFace(h);  // { persist: false } keeps the calibration for this page only
  *   await face.start();          // camera permission; restores a saved calibration
  *   await face.calibrate();      // ~50 s: 17-point grid, smooth pursuit, validation
+ *   await face.check();          // ~8 s: 5 points measure the offset and correct it
  *   // afterwards every mouse click / tap adds a sample and refits the model
  */
 import { FilesetResolver, FaceLandmarker } from './vendor/vision_bundle.mjs';
@@ -19,9 +20,10 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DEG = 180 / Math.PI;
 const median = a => { const s = a.slice().sort((p, q) => p - q); return s.length ? s[Math.floor(s.length / 2)] : 0; };
 const wait = ms => new Promise(r => setTimeout(r, ms));
+const shuffle = a => a.map(p => [Math.random(), p]).sort((p, q) => p[0] - q[0]).map(p => p[1]);
 
 // saved calibrations: STORE_VERSION changes whenever features() changes; NF is the length of its vec
-const STORE_VERSION = 1, NF = 22, KINDS = ['grid', 'pursuit', 'clicks'];
+const STORE_VERSION = 1, NF = 22, KINDS = ['grid', 'pursuit', 'clicks', 'checks'];
 
 // ---------- features
 function eyeFeat(lm, inner, outer, top, bottom, iris, ax) {
@@ -119,14 +121,16 @@ export function attachFace(h, opts = {}) {
     saved: null                          // { at, applied, reason } while a calibration is stored on this device
   };
   ctx.faceState = state;
-  function emptyModel() { return { source: 'none', samples: 0, clicks: 0, cvErrorPx: null, validationErrorPx: null, restoredFrom: null }; }
+  function emptyModel() { return { source: 'none', samples: 0, clicks: 0, cvErrorPx: null, validationErrorPx: null, correctionPx: null, check: null, restoredFrom: null }; }
 
   let video, stream, landmarker, running = false, lastDetect = 0, lastSample = 0, startedAt = 0;
   let model = null, smooth = null, latest = null, sink = null, refitTimer = 0;
+  let offset = { x: 0, y: 0 };          // shift added to the model, learned from this visit's checks and clicks
   let eyesClosed = false, blinkBase = null, closedAt = 0, blinkTimes = [], awaySince = 0, frames = 0, fpsT0 = 0;
   let gazeRegion = null, gazeSince = 0;
   const ring = [];                       // last ~1.5 s of frames for click lookup
-  const samples = { grid: [], pursuit: [], clicks: [] };
+  const samples = { grid: [], pursuit: [], clicks: [], checks: [] };
+  const feedback = [];                   // this visit's latest check points and clicks, for the offset
   const peek = readSaved();
   if (peek) state.saved = { at: peek.at, applied: false, reason: null };
   let exprBase = null, exprBaseBuf = [], exprSmooth = {}, episode = null, candidate = null;
@@ -240,7 +244,7 @@ export function attachFace(h, opts = {}) {
     updateExpression(bs, wall);
 
     if (model && !eyesClosed) {
-      const g = model.predict(f.vec);
+      const g = predict(f.vec);
       smooth = smooth ? { x: smooth.x * 0.65 + g.x * 0.35, y: smooth.y * 0.65 + g.y * 0.35 } : g;
       const W = innerWidth, H = innerHeight;
       state.gaze = { x: clamp(smooth.x, -0.2, 1.2) * W, y: clamp(smooth.y, -0.2, 1.2) * H, onScreen: smooth.x >= 0 && smooth.x <= 1 && smooth.y >= 0 && smooth.y <= 1 };
@@ -315,7 +319,8 @@ export function attachFace(h, opts = {}) {
   function allSamples() {
     return samples.grid.map(s => Object.assign({ w: 3 }, s))
       .concat(samples.pursuit.map(s => Object.assign({ w: 1 }, s)))
-      .concat(samples.clicks.map(s => Object.assign({ w: 2 }, s)));
+      .concat(samples.clicks.map(s => Object.assign({ w: 2 }, s)))
+      .concat(samples.checks.map(s => Object.assign({ w: 3 }, s)));
   }
   function refit(source) {
     const all = allSamples();
@@ -323,8 +328,24 @@ export function attachFace(h, opts = {}) {
     model = fitModel(all, innerWidth, innerHeight);
     state.calibrated = true; smooth = null;
     state.model = Object.assign({}, state.model, { source: source || state.model.source, samples: all.length, clicks: samples.clicks.length, cvErrorPx: model.cvErrorPx });
+    updateOffset();
     emit();
     return true;
+  }
+
+  // ---------- offset: a shift between where the model puts the gaze and where the eyes are, e.g. after
+  // sitting differently than at calibration. The median miss over this visit's last 8 check points and
+  // clicks, applied once there are 3, so one careless click cannot move it far.
+  function predict(f) { const p = model.predict(f); return { x: p.x + offset.x, y: p.y + offset.y }; }
+  function addFeedback(list) { feedback.push(...list); feedback.splice(0, Math.max(0, feedback.length - 8)); }
+  function updateOffset() {
+    if (!model || feedback.length < 3) offset = { x: 0, y: 0 };
+    else {
+      const miss = feedback.map(s => { const p = model.predict(s.f); return { x: s.x - p.x, y: s.y - p.y }; });
+      offset = { x: median(miss.map(d => d.x)), y: median(miss.map(d => d.y)) };
+    }
+    smooth = null;
+    state.model.correctionPx = offset.x || offset.y ? { x: Math.round(offset.x * innerWidth), y: Math.round(offset.y * innerHeight) } : null;
   }
 
   // ---------- persistence: samples, not frames; the next visit refits from them
@@ -363,111 +384,182 @@ export function attachFace(h, opts = {}) {
     if (!running || !ring.length || (e.target && e.target.closest && e.target.closest('.heed-calib'))) return;
     const t = Date.now(), win = ring.filter(r => t - r.t <= 250 && t - r.t >= 0);
     if (win.length < 1) return;
-    const f = win[0].f.map((_, i) => median(win.map(r => r.f[i])));
-    samples.clicks.push({ x: e.clientX / innerWidth, y: e.clientY / innerHeight, f });
+    const f = win[0].f.map((_, i) => median(win.map(r => r.f[i]))), s = { x: e.clientX / innerWidth, y: e.clientY / innerHeight, f };
+    samples.clicks.push(s); addFeedback([s]);
     if (samples.clicks.length > maxClicks) samples.clicks.shift();
+    const g = model && predict(f);
     ctx.record({ kind: 'calibration-click', x: Math.round(e.clientX), y: Math.round(e.clientY), clicks: samples.clicks.length,
-                 predictedErrorPx: model ? Math.round(Math.hypot((model.predict(f).x - e.clientX / innerWidth) * innerWidth, (model.predict(f).y - e.clientY / innerHeight) * innerHeight)) : null });
+                 predictedErrorPx: g ? Math.round(Math.hypot((g.x - s.x) * innerWidth, (g.y - s.y) * innerHeight)) : null });
     clearTimeout(refitTimer);
     refitTimer = setTimeout(() => { if (refit(samples.grid.length ? 'calibration + clicks' : 'clicks only')) save(); }, 250);
   }
   document.addEventListener('pointerdown', onPointerDown, true);
+
+  // ---------- full-screen dot layer shared by calibration and the gaze check
+  function overlay(title, text) {
+    const layer = document.createElement('div');
+    layer.setAttribute('data-heed-ignore', '');
+    layer.className = 'heed-calib';
+    layer.innerHTML = '<div class="heed-calib-card"><b>' + title + '</b><p>' + text + '</p><button type="button" class="go">Start</button></div>' +
+      '<i></i><span class="heed-calib-status"></span><button type="button" class="cancel">Cancel</button>';
+    document.body.appendChild(layer);
+    ctx.calibrating = true;
+    const cancel = layer.querySelector('.cancel');
+    const o = { dot: layer.querySelector('i'), status: layer.querySelector('.heed-calib-status'), cancelled: false };
+    cancel.onclick = () => { o.cancelled = true; };
+    o.begin = () => new Promise(res => { layer.querySelector('.go').onclick = res; cancel.addEventListener('click', res); })
+      .then(() => layer.querySelector('.heed-calib-card').remove());
+    o.place = (x, y) => { o.dot.style.left = (x * 100) + '%'; o.dot.style.top = (y * 100) + '%'; };
+    // median features over at least ms and 5 frames (4 s at most); onFrame also sees each frame
+    o.collect = async (ms, onFrame) => {
+      const got = [];
+      sink = (f, t, bs) => { got.push(f); if (onFrame) onFrame(bs); };
+      const t0 = Date.now();
+      while (!o.cancelled && Date.now() - t0 < 4000 && !(Date.now() - t0 >= ms && got.length >= 5)) await wait(40);
+      sink = null;
+      return got.length >= 2 ? got[0].map((_, i) => median(got.map(g => g[i]))) : null;
+    };
+    // a fixation target: 700 ms for the eyes to land, then collect
+    o.fixate = async (x, y, ms, onFrame) => { o.place(x, y); o.dot.className = ''; await wait(700); o.dot.className = 'hold'; return o.collect(ms, onFrame); };
+    // result card; resolves with the data-act of the button pressed, or 'done' on cancel or after autoMs
+    o.finish = (html, buttons, autoMs) => {
+      o.dot.remove(); o.status.remove();
+      const card = document.createElement('div'); card.className = 'heed-calib-card';
+      card.innerHTML = html + '<div class="heed-calib-actions">' + buttons + '</div>';
+      layer.appendChild(card);
+      return new Promise(res => {
+        card.querySelectorAll('button').forEach(b => { b.onclick = () => res(b.dataset.act); });
+        cancel.addEventListener('click', () => res('done'));
+        if (autoMs) setTimeout(() => res('done'), autoMs);
+      });
+    };
+    o.close = () => { layer.remove(); ctx.calibrating = false; };
+    return o;
+  }
+  const grade = pct => pct <= 8 ? 'good' : pct <= 15 ? 'fair' : 'poor';
+  const saved = ok => !storeKey ? '' : ok ? ' It is saved on this device for your next visit.' : ' It could not be saved on this device (storage full or blocked), so it lasts until you leave the page.';
 
   // ---------- calibration: 17-point grid, smooth pursuit, validation
   async function calibrate(copts = {}) {
     if (!running) await start();
     if (!running) return false;
     const quick = !!copts.quick;
-    const layer = document.createElement('div');
-    layer.setAttribute('data-heed-ignore', '');
-    layer.className = 'heed-calib';
-    layer.innerHTML = '<div class="heed-calib-card"><b>Gaze calibration</b><p>About 50 seconds. Hold the device steady at a comfortable distance and keep your head still. Follow the dot with your eyes.</p><button type="button" class="go">Start</button></div>' +
-      '<i></i><span class="heed-calib-status"></span><button type="button" class="cancel">Cancel</button>';
-    document.body.appendChild(layer);
-    ctx.calibrating = true;
-    const dot = layer.querySelector('i'), status = layer.querySelector('.heed-calib-status'), card = layer.querySelector('.heed-calib-card');
-    let cancelled = false;
-    layer.querySelector('.cancel').onclick = () => { cancelled = true; };
-    await new Promise(res => { layer.querySelector('.go').onclick = res; layer.querySelector('.cancel').addEventListener('click', res); });
-    card.remove();
-    const place = (x, y) => { dot.style.left = (x * 100) + '%'; dot.style.top = (y * 100) + '%'; };
+    const o = overlay('Gaze calibration', 'About 50 seconds. Hold the device steady at a comfortable distance and keep your head still. Follow the dot with your eyes.');
+    await o.begin();
     const baseBuf = [], grid = [], pursuit = [];
-    const collect = async (x, y, ms) => {
-      const got = [];
-      sink = (f, t, bs) => { got.push(f); const raw = {}; EXPRESSIONS.forEach(e => { raw[e.label] = e.score(bs); }); baseBuf.push(raw); };
-      const t0 = Date.now();
-      while (!cancelled && Date.now() - t0 < 4000 && !(Date.now() - t0 >= ms && got.length >= 5)) await wait(40);
-      sink = null;
-      return got.length >= 2 ? got[0].map((_, i) => median(got.map(g => g[i]))) : null;
-    };
+    const toBase = bs => { const raw = {}; EXPRESSIONS.forEach(e => { raw[e.label] = e.score(bs); }); baseBuf.push(raw); };
 
     // 1. grid (randomised order)
     const g4 = [0.06, 0.36, 0.64, 0.94];
-    let targets = quick ? [0.1, 0.5, 0.9].flatMap(y => [0.1, 0.5, 0.9].map(x => [x, y])) : g4.flatMap(y => g4.map(x => [x, y])).concat([[0.5, 0.5]]);
-    targets = targets.map(p => [Math.random(), p]).sort((a, b) => a[0] - b[0]).map(p => p[1]);
-    for (let i = 0; i < targets.length && !cancelled; i++) {
+    const targets = shuffle(quick ? [0.1, 0.5, 0.9].flatMap(y => [0.1, 0.5, 0.9].map(x => [x, y])) : g4.flatMap(y => g4.map(x => [x, y])).concat([[0.5, 0.5]]));
+    for (let i = 0; i < targets.length && !o.cancelled; i++) {
       const [x, y] = targets[i];
-      status.textContent = 'Point ' + (i + 1) + ' of ' + targets.length;
-      place(x, y); dot.className = ''; await wait(700); dot.className = 'hold';
-      const f = await collect(x, y, 900);
+      o.status.textContent = 'Point ' + (i + 1) + ' of ' + targets.length;
+      const f = await o.fixate(x, y, 900, toBase);
       if (f) grid.push({ x, y, f });
     }
     if (baseBuf.length >= 20) setBaseline(baseBuf);
 
     // 2. smooth pursuit: the dot glides along a Lissajous path; targets lag-compensated by 150 ms
-    if (!quick && !cancelled) {
-      status.textContent = 'Follow the moving dot';
-      dot.className = 'pursuit';
-      const T = 14000, t0 = Date.now(), pos = t => { const s = t / 1000; return [0.5 + 0.43 * Math.sin(2 * Math.PI * s / 7), 0.5 + 0.42 * Math.sin(2 * Math.PI * s / 4.6 + Math.PI / 2)]; };
-      place(...pos(0)); await wait(900);
+    if (!quick && !o.cancelled) {
+      o.status.textContent = 'Follow the moving dot';
+      o.dot.className = 'pursuit';
+      const T = 14000, pos = t => { const s = t / 1000; return [0.5 + 0.43 * Math.sin(2 * Math.PI * s / 7), 0.5 + 0.42 * Math.sin(2 * Math.PI * s / 4.6 + Math.PI / 2)]; };
+      o.place(...pos(0)); await wait(900);
       const t1 = Date.now();
       sink = (f, t) => { const [x, y] = pos(Math.max(0, t - t1 - 150)); if (t - t1 > 400) pursuit.push({ x, y, f }); };
-      while (!cancelled && Date.now() - t1 < T) { place(...pos(Date.now() - t1)); await wait(16); }
+      while (!o.cancelled && Date.now() - t1 < T) { o.place(...pos(Date.now() - t1)); await wait(16); }
       sink = null;
     }
 
     // 3. fit, then validate on fresh points. A calibration starts afresh: of the older samples it keeps
-    // only this visit's clicks. Cancelling leaves the previous model as it was.
-    const prev = Object.assign({}, samples), fresh = list => list.filter(s => !s.restored);
-    if (!cancelled) Object.assign(samples, { grid, pursuit: quick ? fresh(samples.pursuit) : pursuit, clicks: fresh(samples.clicks) });
-    if (cancelled || !refit(quick ? 'quick calibration' : 'calibration')) {
-      Object.assign(samples, prev);
-      layer.remove(); ctx.calibrating = false;
+    // only this visit's clicks, and the offset restarts. Cancelling leaves the previous model as it was.
+    const prev = Object.assign({}, samples), prevFeedback = feedback.splice(0), fresh = list => list.filter(s => !s.restored);
+    if (!o.cancelled) Object.assign(samples, { grid, pursuit: quick ? fresh(samples.pursuit) : pursuit, clicks: fresh(samples.clicks), checks: [] });
+    if (o.cancelled || !refit(quick ? 'quick calibration' : 'calibration')) {
+      Object.assign(samples, prev); addFeedback(prevFeedback);
+      o.close();
       ctx.record({ kind: 'calibration', ok: false, points: grid.length });
       return false;
     }
     let validationErrorPx = null;
-    if (!quick && !cancelled) {
-      dot.className = '';
+    if (!quick && !o.cancelled) {
       const val = [[0.25, 0.2], [0.75, 0.22], [0.5, 0.5], [0.22, 0.78], [0.78, 0.8]], errs = [];
-      for (let i = 0; i < val.length && !cancelled; i++) {
-        status.textContent = 'Checking accuracy ' + (i + 1) + ' of ' + val.length;
-        const [x, y] = val[i]; place(x, y); dot.className = ''; await wait(700); dot.className = 'hold';
-        const f = await collect(x, y, 800);
+      for (let i = 0; i < val.length && !o.cancelled; i++) {
+        o.status.textContent = 'Checking accuracy ' + (i + 1) + ' of ' + val.length;
+        const [x, y] = val[i];
+        const f = await o.fixate(x, y, 800);
         if (f) { const p = model.predict(f); errs.push(Math.hypot((p.x - x) * innerWidth, (p.y - y) * innerHeight)); samples.grid.push({ x, y, f }); }
       }
       if (errs.length) validationErrorPx = Math.round(errs.reduce((a, b) => a + b, 0) / errs.length);
       refit('calibration');
     }
-    Object.assign(state.model, { validationErrorPx, restoredFrom: null });
+    Object.assign(state.model, { validationErrorPx, check: null, restoredFrom: null });
     const stored = save();
     const diag = Math.hypot(innerWidth, innerHeight);
     const pct = validationErrorPx ? Math.round(validationErrorPx / diag * 100) : null;
-    const quality = pct === null ? '' : pct <= 8 ? 'good' : pct <= 15 ? 'fair' : 'poor';
     ctx.record({ kind: 'calibration', ok: true, points: samples.grid.length, samples: allSamples().length, pursuit: samples.pursuit.length,
                  meanErrorPx: model.cvErrorPx, validationErrorPx, validationPctOfScreen: pct, lambda: model.lambda });
-    if (validationErrorPx !== null && !cancelled) {
-      dot.remove(); status.remove();
-      const done = document.createElement('div'); done.className = 'heed-calib-card';
-      done.innerHTML = '<b>Calibration ' + quality + '</b><p>Average error on fresh points: ' + validationErrorPx + ' px, about ' + pct + '% of the screen diagonal. Each click or tap from now on refines it.' +
-        (!storeKey ? '' : stored ? ' It is saved on this device for your next visit.' : ' It could not be saved on this device (storage full or blocked), so it lasts until you leave the page.') +
-        '</p><button type="button" class="go">Done</button>';
-      layer.appendChild(done);
-      await new Promise(res => { done.querySelector('.go').onclick = res; layer.querySelector('.cancel').addEventListener('click', res); setTimeout(res, 8000); });
+    if (validationErrorPx !== null && !o.cancelled) {
+      await o.finish('<b>Calibration ' + grade(pct) + '</b><p>Average error on fresh points: ' + validationErrorPx + ' px, about ' + pct + '% of the screen diagonal. Each click or tap from now on refines it.' + saved(stored) + '</p>',
+        '<button type="button" class="go" data-act="done">Done</button>', 8000);
     }
-    layer.remove(); ctx.calibrating = false;
+    o.close();
     emit();
     return true;
+  }
+
+  // ---------- gaze check: 5 fixation targets measure how far and in which direction the gaze point
+  // misses, and set the offset from them. If a shift does not explain the miss, it offers a new calibration.
+  async function check() {
+    if (!running) await start();
+    if (!running) return null;
+    if (!model) return { recalibrated: await calibrate() };
+    const o = overlay('Gaze check', 'About 8 seconds. Look at each dot until it shrinks. heed measures how far off the gaze point is and corrects the offset.');
+    await o.begin();
+    const targets = shuffle([[0.5, 0.5], [0.2, 0.25], [0.8, 0.25], [0.2, 0.75], [0.8, 0.75]]), pts = [];
+    for (let i = 0; i < targets.length && !o.cancelled; i++) {
+      const [x, y] = targets[i];
+      o.status.textContent = 'Point ' + (i + 1) + ' of ' + targets.length;
+      const f = await o.fixate(x, y, 800);
+      if (f) pts.push({ x, y, f });
+    }
+    if (o.cancelled || pts.length < 3) {
+      if (!o.cancelled) await o.finish('<b>Gaze check incomplete</b><p>Your eyes were not visible on enough points. Try again in even light.</p>', '<button type="button" class="go" data-act="done">Done</button>', 8000);
+      o.close(); ctx.record({ kind: 'calibration-check', ok: false, points: pts.length });
+      return null;
+    }
+    const W = innerWidth, H = innerHeight, px = d => Math.hypot(d.x * W, d.y * H), mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+    const mid = list => ({ x: median(list.map(d => d.x)), y: median(list.map(d => d.y)) });
+    // before: where the gaze point was shown, relative to the dot
+    const seen = pts.map(p => { const g = predict(p.f); return { x: g.x - p.x, y: g.y - p.y }; }), shift = mid(seen);
+    // after: each point corrected with the offset learned from the other points, so it is measured on fresh data
+    const miss = pts.map(p => { const g = model.predict(p.f); return { x: p.x - g.x, y: p.y - g.y }; });
+    const held = miss.map((m, i) => { const c = mid(miss.filter((_, j) => j !== i)); return px({ x: m.x - c.x, y: m.y - c.y }); });
+    const diag = Math.hypot(W, H), beforePx = Math.round(mean(seen.map(px))), afterPx = Math.round(mean(held));
+    const result = { ok: true, points: pts.length, beforePx, afterPx, beforePct: Math.round(beforePx / diag * 100), afterPct: Math.round(afterPx / diag * 100),
+                     offsetPx: { x: Math.round(shift.x * W), y: Math.round(shift.y * H) } };
+    result.quality = grade(result.afterPct);
+    // the check points become the offset's evidence and calibration samples
+    feedback.splice(0); addFeedback(pts);
+    samples.checks = samples.checks.concat(pts).slice(-60);
+    refit();
+    state.model.check = Object.assign({ at: Date.now() }, result);
+    save();
+    ctx.record(Object.assign({ kind: 'calibration-check' }, result));
+    const dx = result.offsetPx.x, dy = result.offsetPx.y, parts = [];
+    if (Math.abs(dx) >= 10) parts.push(Math.abs(dx) + ' px ' + (dx < 0 ? 'left' : 'right'));
+    if (Math.abs(dy) >= 10) parts.push(Math.abs(dy) + ' px ' + (dy < 0 ? 'above' : 'below'));
+    const where = parts.length ? 'The gaze point sat mostly ' + parts.join(' and ') + (Math.abs(dy) >= 10 ? ' the dot. ' : ' of the dot. ') : 'There was no consistent shift. ';
+    const poor = result.quality === 'poor';
+    const act = await o.finish('<b>Gaze check: ' + result.quality + '</b><p>Before: ' + beforePx + ' px off on average (' + result.beforePct + '% of the screen diagonal). ' + where +
+        'With the offset corrected: about ' + afterPx + ' px (' + result.afterPct + '%). ' + (poor ? 'A shift does not explain the error, so a new calibration should help.' : 'Clicks and taps keep it on target.') + '</p>',
+      poor ? '<button type="button" class="go" data-act="redo">Recalibrate</button><button type="button" data-act="done">Not now</button>' : '<button type="button" class="go" data-act="done">Done</button>',
+      poor ? 0 : 8000);
+    o.close();
+    emit();
+    if (act === 'redo') result.recalibrated = await calibrate();
+    return result;
   }
 
   const style = document.createElement('style');
@@ -475,6 +567,7 @@ export function attachFace(h, opts = {}) {
     '.heed-calib{position:fixed;inset:0;z-index:2147483600;background:var(--heed-card,#fff);color:var(--heed-card-fg,#09090b);font:15px/1.45 system-ui,-apple-system,sans-serif}' +
     '.heed-calib-card{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(360px,calc(100vw - 48px));display:grid;gap:10px;padding:20px;border:1px solid var(--heed-line,#e4e4e7);border-radius:12px;background:var(--heed-card,#fff)}' +
     '.heed-calib-card p{margin:0;color:var(--heed-muted,#71717a)}.heed-calib-card .go{justify-self:start;background:var(--heed-card-fg,#09090b);color:var(--heed-card,#fff);border-color:var(--heed-card-fg,#09090b)}' +
+    '.heed-calib-actions{display:flex;flex-wrap:wrap;gap:8px}' +
     '.heed-calib-status{position:absolute;left:50%;bottom:max(24px,env(safe-area-inset-bottom,0px));transform:translateX(-50%);font-size:13px;color:var(--heed-muted,#71717a)}' +
     '.heed-calib i{position:absolute;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;background:var(--heed-tint,#2563eb);transition:left .45s ease,top .45s ease,transform .2s}' +
     '.heed-calib i.hold{transform:scale(.5)}.heed-calib i.pursuit{transition:none;transform:scale(.6)}' +
@@ -484,14 +577,14 @@ export function attachFace(h, opts = {}) {
   document.head.appendChild(style);
 
   return {
-    state, start, stop, calibrate,
+    state, start, stop, calibrate, check,
     get video() { return video; },
     onFrame(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-    debug() { return { latest, eyesClosed, running, samples: { grid: samples.grid.length, pursuit: samples.pursuit.length, clicks: samples.clicks.length } }; },
+    debug() { return { latest, eyesClosed, running, offset, samples: { grid: samples.grid.length, pursuit: samples.pursuit.length, clicks: samples.clicks.length, checks: samples.checks.length } }; },
     // forgets the model, its samples and the copy saved on this device
     resetCalibration() {
       clearTimeout(refitTimer); closeGaze('reset');
-      model = null; KINDS.forEach(k => { samples[k] = []; });
+      model = null; offset = { x: 0, y: 0 }; feedback.splice(0); KINDS.forEach(k => { samples[k] = []; });
       state.calibrated = false; state.gaze = null; state.model = emptyModel(); state.saved = null;
       if (storeKey) try { localStorage.removeItem(storeKey); } catch (e) {}
       emit();
