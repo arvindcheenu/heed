@@ -14,6 +14,12 @@ python3 -m http.server 8000    # or: npx serve
 
 Open http://localhost:8000. Browsers allow the camera on `localhost`. From a phone on the same network the camera needs HTTPS, so use the hosted playground or an HTTPS tunnel. The on-device summary downloads its model weights from Hugging Face the first time.
 
+Unit tests for the gaze model need Node 22 or later and nothing else:
+
+```sh
+node --test test/*.test.mjs
+```
+
 ## Files
 
 | File | What it is |
@@ -21,6 +27,7 @@ Open http://localhost:8000. Browsers allow the camera on `localhost`. From a pho
 | `heed.js` | Core: kernel, spec, capture plugins, behaviours, renderers, matrices, timeline, report. No dependencies. |
 | `heed-face.js` | Camera plugin: face mesh, head pose, expressions, blinks, calibrated gaze that learns from clicks, saved calibration, gaze check. |
 | `heed-gaze.js` | The gaze model `heed-face.js` imports: features, ridge regression, offset correction, saved form. No DOM or camera, so it runs in Node. |
+| `test/` | Unit tests for `heed-gaze.js`, on Node's built-in test runner. |
 | `heed-llm.js` | Optional summary written by a small model running in the browser (WebLLM, WebGPU). |
 | `index.html` | Playground with a chat layout and a dashboard layout. |
 | `vendor/` | MediaPipe Face Landmarker 0.10.14 and model, WebLLM 0.2.85. Apache 2.0. |
@@ -135,5 +142,7 @@ Events: `dwell`, `view`, `gaze`, `fixation`, `typing`, `scroll`, `action`, `face
 Headless Chrome on a 390×844 phone viewport with a face video as the camera: camera and model load from `vendor/`, face found (478 landmarks), neutral baseline, full calibration (22 points, pursuit, validation, result card), taps refining the model, pause storing nothing while the camera runs, gaze-based claim check, idle while still looking, a smile detected after a switch from a neutral to a smiling face and recorded with its region, the report using camera gaze, and no page errors or failed requests. Desktop Chrome: pause and resume, self-transitions in data and matrix, report, idle. WebKit (Safari's engine): face model (478 landmarks, 52 blendshapes, head transform) and page interactions. On-device summary: on a software (CPU-emulated) WebGPU adapter the model downloaded and the engine started, but generation was too slow to finish there (an 8-token reply ran past 25 minutes), so the written summary has not been seen yet; it needs a real GPU.
 
 Saved calibration and gaze check: headless Chrome at 1280×800 with a synthetic face model in place of MediaPipe, whose iris landmarks follow a simulated point of regard. The test covered a full calibration (6 px validation error on that synthetic face), the saved copy surviving a reload, the restored model working without recalibrating, a cancelled recalibration keeping the old model and saved copy, and a simulated change in sitting position (error 9 → 193 px) that the check named by direction and corrected (to 16 px). It also covered clicks following a further drift (six clicks roughly halved the error, e.g. 143 → 70 px), a distortion that no offset explains (rated poor, with Recalibrate offered), a different camera not restoring, Forget clearing storage, `persist: false`, the report fields, and no page errors.
+
+Gaze model unit tests (`test/heed-gaze.test.mjs`, a synthetic face with landmark jitter): head pose from the transform, fitting a calibration (unseen points within 3% of the screen diagonal), a feature that differs only by rounding never acting as a predictor, the offset starting with the third click, a check measuring and correcting a pure shift and flagging a distortion, the saved form's round trip and its version and row checks, a new calibration keeping only the current visit's clicks (and undo), and the caps on clicks and check points.
 
 Not tested: a real phone or real eye movement (including for the saved calibration and the gaze check), the summary text on a real GPU (the test face is a photo, so gaze accuracy is unmeasured here), and Firefox.
