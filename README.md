@@ -4,6 +4,16 @@ Attention-aware toolkit for any web page, with a playground at **https://heed.ar
 
 Everything runs in the browser. Video frames never leave the device or get stored; heed keeps only derived numbers.
 
+## Run it locally
+
+No build and no install; the vendored files are in the repo. Serve the folder over HTTP, because ES modules and the camera do not work from `file://`:
+
+```sh
+python3 -m http.server 8000    # or: npx serve
+```
+
+Open http://localhost:8000. Browsers allow the camera on `localhost`. From a phone on the same network the camera needs HTTPS, so use the hosted playground or an HTTPS tunnel. The on-device summary downloads its model weights from Hugging Face the first time.
+
 ## Files
 
 | File | What it is |
