@@ -1112,7 +1112,7 @@
                                 pauses: typing.reduce(function (a, e) { return a + e.pauses; }, 0), meanMsBetweenKeys: Math.round(typing.reduce(function (a, e) { return a + e.meanIKI; }, 0) / typing.length) } : null,
       behaviours: byType,
       samplingAnswers: answers,
-      calibration: cal ? { meanErrorPx: cal.meanErrorPx, validationErrorPx: cal.validationErrorPx, points: cal.points, samples: cal.samples } : null
+      calibration: cal ? { meanErrorPx: cal.meanErrorPx, validationErrorPx: cal.validationErrorPx, points: cal.points, samples: cal.samples, savedFromEarlierVisit: !!cal.restored } : null
     };
   }
 

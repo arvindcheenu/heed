@@ -249,7 +249,7 @@ select { font: inherit; font-size: 13px; border-radius: 7px; border: 1px solid v
         <div class="face"><canvas id="mesh" width="240" height="180" aria-label="Camera preview with face mesh"></canvas><dl id="face-dl"></dl></div></div>
       <div class="field"><span class="label">Findings at or above level</span><div class="log" id="log"></div></div>
       <details><summary>Spec</summary><pre id="spec"></pre></details>
-      <div class="actions"><button type="button" id="copy">Copy session JSON</button><button type="button" id="reset">Reset</button><span class="state" id="copied"></span></div>
+      <div class="actions"><button type="button" id="copy">Copy session JSON</button><button type="button" id="reset">Reset</button><button type="button" id="forget" hidden>Forget gaze calibration</button><span class="state" id="copied"></span></div>
       <p class="empty">Open the page in a second tab to see peers.</p>
     </aside>
   </div>
@@ -436,7 +436,8 @@ select { font: inherit; font-size: 13px; border-radius: 7px; border: 1px solid v
     if (!s.camera) ex = [li('<span class="state">Camera was off, so no expressions</span>')];
     var typing = r.typing ? [li(r.typing.messages + ' messages, ' + r.typing.keys + ' keys, ' + r.typing.corrections + ' corrections, ' + r.typing.pauses + ' pauses, ' + r.typing.meanMsBetweenKeys + ' ms between keys')] : [];
     var sess = [li(s.recordedMinutes + ' min recorded of ' + s.minutes + ' (' + s.pausedSeconds + ' s paused)'), li('Attention from ' + s.attentionSource)];
-    if (r.calibration) sess.push(li('Gaze calibration: ' + (r.calibration.validationErrorPx || r.calibration.meanErrorPx) + ' px error, ' + r.calibration.samples + ' samples'));
+    var c = r.calibration, cErr = c && (c.validationErrorPx || c.meanErrorPx);
+    if (cErr) sess.push(li('Gaze calibration' + (c.savedFromEarlierVisit ? ' (saved from an earlier visit)' : '') + ': ' + cErr + ' px error, ' + c.samples + ' samples'));
     $('facts').innerHTML = card('Session', sess) + card('Focus', focus) + card('Moves', moves) + card('Claims', claims) + card('Idle and away', idle) + card('Expressions', ex) + (typing.length ? card('Typing', typing) : '') +
       '<details class="fact"><summary>Raw facts (JSON)</summary><pre>' + esc(JSON.stringify(r, null, 2)) + '</pre></details>';
     var sb = $('summarize'); if (sb) sb.disabled = false;
@@ -471,9 +472,8 @@ $('summarize').addEventListener('click', async () => {
   } catch (e) { $('llm-status').textContent = 'Summary unavailable: ' + (e && e.message || e); if (!out.textContent) out.hidden = true; }
   busy = false; $('summarize').disabled = false;
 });
-$('cam-state').textContent = 'Camera off · cursor, scroll, typing and actions';
-
 window.__extraSpec = () => face.state.calibrated ? { signals: ['gaze', 'dwell'] } : {};
+let note = '';
 $('show').addEventListener('change', () => paint());
 $('cam').addEventListener('click', async () => {
   if (face.state.status === 'running') face.stop(); else await face.start();
@@ -481,21 +481,35 @@ $('cam').addEventListener('click', async () => {
 });
 $('calib').addEventListener('click', async () => {
   const ok = await face.calibrate();
-  $('cam-state').textContent = ok ? 'Gaze calibrated' : 'Calibration cancelled or no face found; try again in even light';
+  note = ok ? '' : 'calibration cancelled or no face found; try again in even light';
+  window.applySpec(); paint();
+});
+$('forget').addEventListener('click', () => {
+  face.resetCalibration(); note = '';
   window.applySpec(); paint();
 });
 
+const when = t => new Date(t).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+const NOT_RESTORED = { camera: 'was made with another camera', orientation: 'was made in the other screen orientation', format: 'could not be read' };
+function camText(st) {
+  const m = st.model;
+  if (st.calibrated) return 'Camera on · gaze ' + (m.restoredFrom ? 'from your saved calibration (' + when(m.restoredFrom) + ')' : 'calibrated');
+  if (st.saved && st.saved.reason) return 'Camera on · the saved calibration ' + NOT_RESTORED[st.saved.reason] + '; calibrate to add gaze';
+  return 'Camera on · calibrate to add gaze';
+}
 function paint() {
   const st = face.state, on = st.status === 'running', show = $('show').checked;
   $('cam').textContent = on ? 'Stop camera' : st.status === 'loading' ? 'Starting…' : 'Start camera';
   $('cam').classList.toggle('primary', !on);
   $('calib').disabled = !on;
+  $('forget').hidden = !(st.saved || st.calibrated);
   $('face-field').hidden = !on;
   $('hud').hidden = !(on && show);
   $('dot').hidden = !(on && show && st.gaze && st.gaze.onScreen);
   if (st.status === 'error') $('cam-state').textContent = st.error;
   else if (st.status === 'loading') $('cam-state').textContent = 'Loading the face model (13 MB, once)…';
-  else if (on) $('cam-state').textContent = st.calibrated ? 'Camera on · gaze calibrated' : 'Camera on · calibrate to add gaze';
+  else if (on) $('cam-state').textContent = camText(st) + (note ? ' · ' + note : '');
+  else $('cam-state').textContent = 'Camera off · ' + (st.saved ? 'a saved gaze calibration is ready' : 'cursor, scroll, typing and actions');
 }
 function drawMesh(canvas, st) {
   const c = canvas.getContext('2d'), W = canvas.width, H = canvas.height, v = face.video;
