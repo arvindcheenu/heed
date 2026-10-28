@@ -12,81 +12,16 @@
  *   await face.calibrate();      // ~50 s: 17-point grid, smooth pursuit, validation
  *   await face.check();          // ~8 s: 5 points measure the offset and correct it
  *   // afterwards every mouse click / tap adds a sample and refits the model
+ * The gaze model itself (features, regression, offset, saved form) is in heed-gaze.js.
  */
 import { FilesetResolver, FaceLandmarker } from './vendor/vision_bundle.mjs';
+import { features, createGaze, median, STORE_VERSION } from './heed-gaze.js';
 
 const VENDOR = new URL('./vendor/', import.meta.url).href;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DEG = 180 / Math.PI;
-const median = a => { const s = a.slice().sort((p, q) => p - q); return s.length ? s[Math.floor(s.length / 2)] : 0; };
 const wait = ms => new Promise(r => setTimeout(r, ms));
 const shuffle = a => a.map(p => [Math.random(), p]).sort((p, q) => p[0] - q[0]).map(p => p[1]);
-
-// saved calibrations: STORE_VERSION changes whenever features() changes; NF is the length of its vec
-const STORE_VERSION = 1, NF = 22, KINDS = ['grid', 'pursuit', 'clicks', 'checks'];
-
-// ---------- features
-function eyeFeat(lm, inner, outer, top, bottom, iris, ax) {
-  const ux = (lm[outer].x - lm[inner].x) * ax, uy = lm[outer].y - lm[inner].y, len = Math.hypot(ux, uy) || 1e-6;
-  const nx = -uy / len, ny = ux / len, rx = (lm[iris].x - lm[inner].x) * ax, ry = lm[iris].y - lm[inner].y;
-  return { h: (rx * ux + ry * uy) / (len * len), v: (rx * nx + ry * ny) / len, open: (lm[bottom].y - lm[top].y) / len, len };
-}
-function features(lm, matrix, ax) {
-  const m = matrix.data; // 4x4 column-major
-  const pitch = Math.atan2(m[6], m[10]), yaw = Math.asin(clamp(-m[2], -1, 1)), roll = Math.atan2(m[1], m[0]);
-  const tx = m[12] / 10, ty = m[13] / 10, tz = m[14] / 10;
-  let r = { h: 0, v: 0, open: 0, len: 0 }, l = r;
-  if (lm.length >= 478) { r = eyeFeat(lm, 133, 33, 159, 145, 468, ax); l = eyeFeat(lm, 362, 263, 386, 374, 473, ax); }
-  const hm = (r.h - l.h) / 2, vm = (r.v - l.v) / 2, open = (r.open + l.open) / 2;
-  const nose = lm[1], iod = Math.hypot((lm[33].x - lm[263].x) * ax, lm[33].y - lm[263].y);
-  const base = [yaw, pitch, roll, tx, ty, tz, r.h, r.v, l.h, l.v, open, nose.x, nose.y, iod];
-  const vec = base.concat([yaw * yaw, pitch * pitch, hm * hm, vm * vm, yaw * pitch, hm * yaw, vm * pitch, hm * vm]);
-  return { yaw, pitch, roll, vec };
-}
-
-// ---------- weighted ridge regression with lambda chosen by 5-fold cross-validation
-function solve(A, b) {
-  const n = b.length, M = A.map((row, i) => row.concat([b[i]]));
-  for (let c = 0; c < n; c++) {
-    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
-    [M[c], M[p]] = [M[p], M[c]];
-    const d = M[c][c] || 1e-9;
-    for (let r = 0; r < n; r++) { if (r === c) continue; const f = M[r][c] / d; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
-  }
-  return M.map((row, i) => row[n] / (row[i] || 1e-9));
-}
-function fitModel(samples, W, H) {
-  const k = samples[0].f.length, sw = samples.reduce((a, s) => a + s.w, 0);
-  const mean = Array(k).fill(0), sd = Array(k).fill(0);
-  samples.forEach(s => s.f.forEach((x, i) => { mean[i] += s.w * x / sw; }));
-  samples.forEach(s => s.f.forEach((x, i) => { sd[i] += s.w * (x - mean[i]) ** 2 / sw; }));
-  // a feature that only varies by rounding (saved samples keep 6 digits) is constant: z = 0
-  for (let i = 0; i < k; i++) { sd[i] = Math.sqrt(sd[i]); if (!(sd[i] > 1e-5 * (Math.abs(mean[i]) + 1e-3))) sd[i] = Infinity; }
-  const z = f => [1].concat(f.map((x, i) => (x - mean[i]) / sd[i]));
-  const rows = samples.map(s => ({ x: z(s.f), tx: s.x, ty: s.y, w: s.w }));
-  const train = (set, lambda) => {
-    const p = k + 1, A = Array.from({ length: p }, () => Array(p).fill(0)), bx = Array(p).fill(0), by = Array(p).fill(0);
-    set.forEach(r => { for (let i = 0; i < p; i++) { bx[i] += r.w * r.x[i] * r.tx; by[i] += r.w * r.x[i] * r.ty; for (let j = 0; j < p; j++) A[i][j] += r.w * r.x[i] * r.x[j]; } });
-    for (let i = 1; i < p; i++) A[i][i] += lambda * sw / set.length;
-    return [solve(A, bx), solve(A, by)];
-  };
-  const dot = (w, x) => w.reduce((a, wi, i) => a + wi * x[i], 0);
-  const err = (wts, set) => set.reduce((a, r) => a + Math.hypot((dot(wts[0], r.x) - r.tx) * W, (dot(wts[1], r.x) - r.ty) * H), 0) / set.length;
-  let best = { lambda: 1, cv: Infinity };
-  if (rows.length >= 15) {
-    [0.01, 0.1, 0.3, 1, 3, 10, 30].forEach(lambda => {
-      let e = 0;
-      for (let fold = 0; fold < 5; fold++) {
-        const tr = rows.filter((_, i) => i % 5 !== fold), te = rows.filter((_, i) => i % 5 === fold);
-        if (te.length && tr.length > k) e += err(train(tr, lambda), te) / 5;
-      }
-      if (e < best.cv) best = { lambda, cv: e };
-    });
-  } else best = { lambda: 3, cv: null };
-  const wts = train(rows, best.lambda);
-  return { lambda: best.lambda, cvErrorPx: best.cv === null ? null : Math.round(best.cv),
-           predict: f => { const x = z(f); return { x: dot(wts[0], x), y: dot(wts[1], x) }; } };
-}
 
 // ---------- expressions (facial action proxies, not felt emotion)
 const EXPRESSIONS = [
@@ -124,13 +59,11 @@ export function attachFace(h, opts = {}) {
   function emptyModel() { return { source: 'none', samples: 0, clicks: 0, cvErrorPx: null, validationErrorPx: null, correctionPx: null, check: null, restoredFrom: null }; }
 
   let video, stream, landmarker, running = false, lastDetect = 0, lastSample = 0, startedAt = 0;
-  let model = null, smooth = null, latest = null, sink = null, refitTimer = 0;
-  let offset = { x: 0, y: 0 };          // shift added to the model, learned from this visit's checks and clicks
+  let smooth = null, latest = null, sink = null, refitTimer = 0;
   let eyesClosed = false, blinkBase = null, closedAt = 0, blinkTimes = [], awaySince = 0, frames = 0, fpsT0 = 0;
   let gazeRegion = null, gazeSince = 0;
   const ring = [];                       // last ~1.5 s of frames for click lookup
-  const samples = { grid: [], pursuit: [], clicks: [], checks: [] };
-  const feedback = [];                   // this visit's latest check points and clicks, for the offset
+  const gaze = createGaze({ maxClicks });
   const peek = readSaved();
   if (peek) state.saved = { at: peek.at, applied: false, reason: null };
   let exprBase = null, exprBaseBuf = [], exprSmooth = {}, episode = null, candidate = null;
@@ -168,7 +101,7 @@ export function attachFace(h, opts = {}) {
     }
     running = true; state.status = 'running'; fpsT0 = performance.now(); frames = 0; startedAt = Date.now();
     ctx.record({ kind: 'face-start', calibrated: state.calibrated });
-    if (!model) restore();
+    if (!gaze.model) restore();
     loop(); emit();
   }
 
@@ -243,8 +176,8 @@ export function attachFace(h, opts = {}) {
 
     updateExpression(bs, wall);
 
-    if (model && !eyesClosed) {
-      const g = predict(f.vec);
+    if (gaze.model && !eyesClosed) {
+      const g = gaze.predict(f.vec);
       smooth = smooth ? { x: smooth.x * 0.65 + g.x * 0.35, y: smooth.y * 0.65 + g.y * 0.35 } : g;
       const W = innerWidth, H = innerHeight;
       state.gaze = { x: clamp(smooth.x, -0.2, 1.2) * W, y: clamp(smooth.y, -0.2, 1.2) * H, onScreen: smooth.x >= 0 && smooth.x <= 1 && smooth.y >= 0 && smooth.y <= 1 };
@@ -315,37 +248,15 @@ export function attachFace(h, opts = {}) {
     if (r) { gazeRegion = r; gazeSince = Date.now(); }
   }
 
-  // ---------- model fitting
-  function allSamples() {
-    return samples.grid.map(s => Object.assign({ w: 3 }, s))
-      .concat(samples.pursuit.map(s => Object.assign({ w: 1 }, s)))
-      .concat(samples.clicks.map(s => Object.assign({ w: 2 }, s)))
-      .concat(samples.checks.map(s => Object.assign({ w: 3 }, s)));
-  }
+  // ---------- model fitting (the model lives in heed-gaze.js; this keeps the state in step)
   function refit(source) {
-    const all = allSamples();
-    if (all.length < 8) return false;
-    model = fitModel(all, innerWidth, innerHeight);
+    if (!gaze.refit(innerWidth, innerHeight)) return false;
+    const m = gaze.model, o = gaze.offset;
     state.calibrated = true; smooth = null;
-    state.model = Object.assign({}, state.model, { source: source || state.model.source, samples: all.length, clicks: samples.clicks.length, cvErrorPx: model.cvErrorPx });
-    updateOffset();
+    state.model = Object.assign({}, state.model, { source: source || state.model.source, samples: gaze.all().length, clicks: gaze.samples.clicks.length, cvErrorPx: m.cvErrorPx,
+      correctionPx: o.x || o.y ? { x: Math.round(o.x * innerWidth), y: Math.round(o.y * innerHeight) } : null });
     emit();
     return true;
-  }
-
-  // ---------- offset: a shift between where the model puts the gaze and where the eyes are, e.g. after
-  // sitting differently than at calibration. The median miss over this visit's last 8 check points and
-  // clicks, applied once there are 3, so one careless click cannot move it far.
-  function predict(f) { const p = model.predict(f); return { x: p.x + offset.x, y: p.y + offset.y }; }
-  function addFeedback(list) { feedback.push(...list); feedback.splice(0, Math.max(0, feedback.length - 8)); }
-  function updateOffset() {
-    if (!model || feedback.length < 3) offset = { x: 0, y: 0 };
-    else {
-      const miss = feedback.map(s => { const p = model.predict(s.f); return { x: s.x - p.x, y: s.y - p.y }; });
-      offset = { x: median(miss.map(d => d.x)), y: median(miss.map(d => d.y)) };
-    }
-    smooth = null;
-    state.model.correctionPx = offset.x || offset.y ? { x: Math.round(offset.x * innerWidth), y: Math.round(offset.y * innerHeight) } : null;
   }
 
   // ---------- persistence: samples, not frames; the next visit refits from them
@@ -358,10 +269,8 @@ export function attachFace(h, opts = {}) {
     return { label: track ? track.label : '', aspect: video && video.videoHeight ? +(video.videoWidth / video.videoHeight).toFixed(3) : null };
   }
   function save() {
-    if (!storeKey || !model || !running) return false;
-    const pack = s => [s.x, s.y].concat(s.f).map(v => +v.toPrecision(6));
-    const d = Object.assign({ v: STORE_VERSION, at: Date.now(), w: innerWidth, h: innerHeight, validationErrorPx: state.model.validationErrorPx }, camera());
-    KINDS.forEach(k => { d[k] = samples[k].map(pack); });
+    if (!storeKey || !gaze.model || !running) return false;
+    const d = Object.assign(gaze.toJSON(), { at: Date.now(), w: innerWidth, h: innerHeight, validationErrorPx: state.model.validationErrorPx }, camera());
     try { localStorage.setItem(storeKey, JSON.stringify(d)); state.saved = { at: d.at, applied: true, reason: null }; return true; } catch (e) { return false; }
   }
   // A saved calibration only fits the camera and screen orientation it was made with.
@@ -371,12 +280,12 @@ export function attachFace(h, opts = {}) {
     const reason = d.label !== cam.label || Math.abs(d.aspect - cam.aspect) > 0.05 ? 'camera' : (d.w > d.h) !== (innerWidth > innerHeight) ? 'orientation' : null;
     state.saved = { at: d.at, applied: false, reason };
     if (reason) return;
-    KINDS.forEach(k => { samples[k] = (d[k] || []).filter(r => r.length === NF + 2).map(r => ({ x: r[0], y: r[1], f: r.slice(2), restored: true })); });
-    if (!refit('saved calibration')) { KINDS.forEach(k => { samples[k] = []; }); state.saved.reason = 'format'; return; }
+    gaze.load(d);
+    if (!refit('saved calibration')) { gaze.reset(); state.saved.reason = 'format'; return; }
     state.saved.applied = true;
     Object.assign(state.model, { validationErrorPx: d.validationErrorPx, restoredFrom: d.at });
-    ctx.record({ kind: 'calibration', ok: true, restored: true, savedAt: d.at, points: samples.grid.length, samples: allSamples().length,
-                 pursuit: samples.pursuit.length, meanErrorPx: model.cvErrorPx, validationErrorPx: d.validationErrorPx, lambda: model.lambda });
+    ctx.record({ kind: 'calibration', ok: true, restored: true, savedAt: d.at, points: gaze.samples.grid.length, samples: gaze.all().length,
+                 pursuit: gaze.samples.pursuit.length, meanErrorPx: gaze.model.cvErrorPx, validationErrorPx: d.validationErrorPx, lambda: gaze.model.lambda });
   }
 
   // Every mouse click or tap is a labelled sample: people look where they click.
@@ -385,13 +294,12 @@ export function attachFace(h, opts = {}) {
     const t = Date.now(), win = ring.filter(r => t - r.t <= 250 && t - r.t >= 0);
     if (win.length < 1) return;
     const f = win[0].f.map((_, i) => median(win.map(r => r.f[i]))), s = { x: e.clientX / innerWidth, y: e.clientY / innerHeight, f };
-    samples.clicks.push(s); addFeedback([s]);
-    if (samples.clicks.length > maxClicks) samples.clicks.shift();
-    const g = model && predict(f);
-    ctx.record({ kind: 'calibration-click', x: Math.round(e.clientX), y: Math.round(e.clientY), clicks: samples.clicks.length,
+    gaze.addClick(s);
+    const g = gaze.model && gaze.predict(f);
+    ctx.record({ kind: 'calibration-click', x: Math.round(e.clientX), y: Math.round(e.clientY), clicks: gaze.samples.clicks.length,
                  predictedErrorPx: g ? Math.round(Math.hypot((g.x - s.x) * innerWidth, (g.y - s.y) * innerHeight)) : null });
     clearTimeout(refitTimer);
-    refitTimer = setTimeout(() => { if (refit(samples.grid.length ? 'calibration + clicks' : 'clicks only')) save(); }, 250);
+    refitTimer = setTimeout(() => { if (refit(gaze.samples.grid.length ? 'calibration + clicks' : 'clicks only')) save(); }, 250);
   }
   document.addEventListener('pointerdown', onPointerDown, true);
 
@@ -474,10 +382,9 @@ export function attachFace(h, opts = {}) {
 
     // 3. fit, then validate on fresh points. A calibration starts afresh: of the older samples it keeps
     // only this visit's clicks, and the offset restarts. Cancelling leaves the previous model as it was.
-    const prev = Object.assign({}, samples), prevFeedback = feedback.splice(0), fresh = list => list.filter(s => !s.restored);
-    if (!o.cancelled) Object.assign(samples, { grid, pursuit: quick ? fresh(samples.pursuit) : pursuit, clicks: fresh(samples.clicks), checks: [] });
-    if (o.cancelled || !refit(quick ? 'quick calibration' : 'calibration')) {
-      Object.assign(samples, prev); addFeedback(prevFeedback);
+    const undo = o.cancelled ? null : gaze.restart(grid, quick ? null : pursuit);
+    if (!undo || !refit(quick ? 'quick calibration' : 'calibration')) {
+      if (undo) undo();
       o.close();
       ctx.record({ kind: 'calibration', ok: false, points: grid.length });
       return false;
@@ -489,7 +396,7 @@ export function attachFace(h, opts = {}) {
         o.status.textContent = 'Checking accuracy ' + (i + 1) + ' of ' + val.length;
         const [x, y] = val[i];
         const f = await o.fixate(x, y, 800);
-        if (f) { const p = model.predict(f); errs.push(Math.hypot((p.x - x) * innerWidth, (p.y - y) * innerHeight)); samples.grid.push({ x, y, f }); }
+        if (f) { const p = gaze.model.predict(f); errs.push(Math.hypot((p.x - x) * innerWidth, (p.y - y) * innerHeight)); gaze.samples.grid.push({ x, y, f }); }
       }
       if (errs.length) validationErrorPx = Math.round(errs.reduce((a, b) => a + b, 0) / errs.length);
       refit('calibration');
@@ -498,8 +405,8 @@ export function attachFace(h, opts = {}) {
     const stored = save();
     const diag = Math.hypot(innerWidth, innerHeight);
     const pct = validationErrorPx ? Math.round(validationErrorPx / diag * 100) : null;
-    ctx.record({ kind: 'calibration', ok: true, points: samples.grid.length, samples: allSamples().length, pursuit: samples.pursuit.length,
-                 meanErrorPx: model.cvErrorPx, validationErrorPx, validationPctOfScreen: pct, lambda: model.lambda });
+    ctx.record({ kind: 'calibration', ok: true, points: gaze.samples.grid.length, samples: gaze.all().length, pursuit: gaze.samples.pursuit.length,
+                 meanErrorPx: gaze.model.cvErrorPx, validationErrorPx, validationPctOfScreen: pct, lambda: gaze.model.lambda });
     if (validationErrorPx !== null && !o.cancelled) {
       await o.finish('<b>Calibration ' + grade(pct) + '</b><p>Average error on fresh points: ' + validationErrorPx + ' px, about ' + pct + '% of the screen diagonal. Each click or tap from now on refines it.' + saved(stored) + '</p>',
         '<button type="button" class="go" data-act="done">Done</button>', 8000);
@@ -514,7 +421,7 @@ export function attachFace(h, opts = {}) {
   async function check() {
     if (!running) await start();
     if (!running) return null;
-    if (!model) return { recalibrated: await calibrate() };
+    if (!gaze.model) return { recalibrated: await calibrate() };
     const o = overlay('Gaze check', 'About 8 seconds. Look at each dot until it shrinks. heed measures how far off the gaze point is and corrects the offset.');
     await o.begin();
     const targets = shuffle([[0.5, 0.5], [0.2, 0.25], [0.8, 0.25], [0.2, 0.75], [0.8, 0.75]]), pts = [];
@@ -529,20 +436,10 @@ export function attachFace(h, opts = {}) {
       o.close(); ctx.record({ kind: 'calibration-check', ok: false, points: pts.length });
       return null;
     }
-    const W = innerWidth, H = innerHeight, px = d => Math.hypot(d.x * W, d.y * H), mean = a => a.reduce((s, v) => s + v, 0) / a.length;
-    const mid = list => ({ x: median(list.map(d => d.x)), y: median(list.map(d => d.y)) });
-    // before: where the gaze point was shown, relative to the dot
-    const seen = pts.map(p => { const g = predict(p.f); return { x: g.x - p.x, y: g.y - p.y }; }), shift = mid(seen);
-    // after: each point corrected with the offset learned from the other points, so it is measured on fresh data
-    const miss = pts.map(p => { const g = model.predict(p.f); return { x: p.x - g.x, y: p.y - g.y }; });
-    const held = miss.map((m, i) => { const c = mid(miss.filter((_, j) => j !== i)); return px({ x: m.x - c.x, y: m.y - c.y }); });
-    const diag = Math.hypot(W, H), beforePx = Math.round(mean(seen.map(px))), afterPx = Math.round(mean(held));
-    const result = { ok: true, points: pts.length, beforePx, afterPx, beforePct: Math.round(beforePx / diag * 100), afterPct: Math.round(afterPx / diag * 100),
-                     offsetPx: { x: Math.round(shift.x * W), y: Math.round(shift.y * H) } };
+    const result = Object.assign({ ok: true, points: pts.length }, gaze.measure(pts, innerWidth, innerHeight)), { beforePx, afterPx } = result;
     result.quality = grade(result.afterPct);
     // the check points become the offset's evidence and calibration samples
-    feedback.splice(0); addFeedback(pts);
-    samples.checks = samples.checks.concat(pts).slice(-60);
+    gaze.addChecks(pts);
     refit();
     state.model.check = Object.assign({ at: Date.now() }, result);
     save();
@@ -580,11 +477,11 @@ export function attachFace(h, opts = {}) {
     state, start, stop, calibrate, check,
     get video() { return video; },
     onFrame(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-    debug() { return { latest, eyesClosed, running, offset, samples: { grid: samples.grid.length, pursuit: samples.pursuit.length, clicks: samples.clicks.length, checks: samples.checks.length } }; },
+    debug() { const s = gaze.samples; return { latest, eyesClosed, running, offset: gaze.offset, samples: { grid: s.grid.length, pursuit: s.pursuit.length, clicks: s.clicks.length, checks: s.checks.length } }; },
     // forgets the model, its samples and the copy saved on this device
     resetCalibration() {
       clearTimeout(refitTimer); closeGaze('reset');
-      model = null; offset = { x: 0, y: 0 }; feedback.splice(0); KINDS.forEach(k => { samples[k] = []; });
+      gaze.reset();
       state.calibrated = false; state.gaze = null; state.model = emptyModel(); state.saved = null;
       if (storeKey) try { localStorage.removeItem(storeKey); } catch (e) {}
       emit();

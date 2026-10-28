@@ -19,7 +19,8 @@ Open http://localhost:8000. Browsers allow the camera on `localhost`. From a pho
 | File | What it is |
 | --- | --- |
 | `heed.js` | Core: kernel, spec, capture plugins, behaviours, renderers, matrices, timeline, report. No dependencies. |
-| `heed-face.js` | Camera plugin: face mesh, head pose, expressions, blinks, calibrated gaze that learns from clicks. |
+| `heed-face.js` | Camera plugin: face mesh, head pose, expressions, blinks, calibrated gaze that learns from clicks, saved calibration, gaze check. |
+| `heed-gaze.js` | The gaze model `heed-face.js` imports: features, ridge regression, offset correction, saved form. No DOM or camera, so it runs in Node. |
 | `heed-llm.js` | Optional summary written by a small model running in the browser (WebLLM, WebGPU). |
 | `index.html` | Playground with a chat layout and a dashboard layout. |
 | `vendor/` | MediaPipe Face Landmarker 0.10.14 and model, WebLLM 0.2.85. Apache 2.0. |
