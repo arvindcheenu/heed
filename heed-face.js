@@ -4,82 +4,24 @@
  *   head pose, expressions (relative to the person's own neutral face), blinks, presence,
  *   and a gaze point from a calibrated model that keeps learning from clicks and taps.
  * Gaze dwell on [data-heed] regions is recorded as kind 'gaze'. No frames are stored or sent.
+ * The calibration samples (derived numbers) are kept in localStorage for the next visit.
  *
  *   import { attachFace } from './heed-face.js';
- *   const face = attachFace(h);
- *   await face.start();          // camera permission
+ *   const face = attachFace(h);  // { persist: false } keeps the calibration for this page only
+ *   await face.start();          // camera permission; restores a saved calibration
  *   await face.calibrate();      // ~50 s: 17-point grid, smooth pursuit, validation
+ *   await face.check();          // ~8 s: 5 points measure the offset and correct it
  *   // afterwards every mouse click / tap adds a sample and refits the model
+ * The gaze model itself (features, regression, offset, saved form) is in heed-gaze.js.
  */
 import { FilesetResolver, FaceLandmarker } from './vendor/vision_bundle.mjs';
+import { features, createGaze, median, STORE_VERSION } from './heed-gaze.js';
 
 const VENDOR = new URL('./vendor/', import.meta.url).href;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const DEG = 180 / Math.PI;
-const median = a => { const s = a.slice().sort((p, q) => p - q); return s.length ? s[Math.floor(s.length / 2)] : 0; };
 const wait = ms => new Promise(r => setTimeout(r, ms));
-
-// ---------- features
-function eyeFeat(lm, inner, outer, top, bottom, iris, ax) {
-  const ux = (lm[outer].x - lm[inner].x) * ax, uy = lm[outer].y - lm[inner].y, len = Math.hypot(ux, uy) || 1e-6;
-  const nx = -uy / len, ny = ux / len, rx = (lm[iris].x - lm[inner].x) * ax, ry = lm[iris].y - lm[inner].y;
-  return { h: (rx * ux + ry * uy) / (len * len), v: (rx * nx + ry * ny) / len, open: (lm[bottom].y - lm[top].y) / len, len };
-}
-function features(lm, matrix, ax) {
-  const m = matrix.data; // 4x4 column-major
-  const pitch = Math.atan2(m[6], m[10]), yaw = Math.asin(clamp(-m[2], -1, 1)), roll = Math.atan2(m[1], m[0]);
-  const tx = m[12] / 10, ty = m[13] / 10, tz = m[14] / 10;
-  let r = { h: 0, v: 0, open: 0, len: 0 }, l = r;
-  if (lm.length >= 478) { r = eyeFeat(lm, 133, 33, 159, 145, 468, ax); l = eyeFeat(lm, 362, 263, 386, 374, 473, ax); }
-  const hm = (r.h - l.h) / 2, vm = (r.v - l.v) / 2, open = (r.open + l.open) / 2;
-  const nose = lm[1], iod = Math.hypot((lm[33].x - lm[263].x) * ax, lm[33].y - lm[263].y);
-  const base = [yaw, pitch, roll, tx, ty, tz, r.h, r.v, l.h, l.v, open, nose.x, nose.y, iod];
-  const vec = base.concat([yaw * yaw, pitch * pitch, hm * hm, vm * vm, yaw * pitch, hm * yaw, vm * pitch, hm * vm]);
-  return { yaw, pitch, roll, vec };
-}
-
-// ---------- weighted ridge regression with lambda chosen by 5-fold cross-validation
-function solve(A, b) {
-  const n = b.length, M = A.map((row, i) => row.concat([b[i]]));
-  for (let c = 0; c < n; c++) {
-    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
-    [M[c], M[p]] = [M[p], M[c]];
-    const d = M[c][c] || 1e-9;
-    for (let r = 0; r < n; r++) { if (r === c) continue; const f = M[r][c] / d; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
-  }
-  return M.map((row, i) => row[n] / (row[i] || 1e-9));
-}
-function fitModel(samples, W, H) {
-  const k = samples[0].f.length, sw = samples.reduce((a, s) => a + s.w, 0);
-  const mean = Array(k).fill(0), sd = Array(k).fill(0);
-  samples.forEach(s => s.f.forEach((x, i) => { mean[i] += s.w * x / sw; }));
-  samples.forEach(s => s.f.forEach((x, i) => { sd[i] += s.w * (x - mean[i]) ** 2 / sw; }));
-  for (let i = 0; i < k; i++) sd[i] = Math.sqrt(sd[i]) || 1;
-  const z = f => [1].concat(f.map((x, i) => (x - mean[i]) / sd[i]));
-  const rows = samples.map(s => ({ x: z(s.f), tx: s.x, ty: s.y, w: s.w }));
-  const train = (set, lambda) => {
-    const p = k + 1, A = Array.from({ length: p }, () => Array(p).fill(0)), bx = Array(p).fill(0), by = Array(p).fill(0);
-    set.forEach(r => { for (let i = 0; i < p; i++) { bx[i] += r.w * r.x[i] * r.tx; by[i] += r.w * r.x[i] * r.ty; for (let j = 0; j < p; j++) A[i][j] += r.w * r.x[i] * r.x[j]; } });
-    for (let i = 1; i < p; i++) A[i][i] += lambda * sw / set.length;
-    return [solve(A, bx), solve(A, by)];
-  };
-  const dot = (w, x) => w.reduce((a, wi, i) => a + wi * x[i], 0);
-  const err = (wts, set) => set.reduce((a, r) => a + Math.hypot((dot(wts[0], r.x) - r.tx) * W, (dot(wts[1], r.x) - r.ty) * H), 0) / set.length;
-  let best = { lambda: 1, cv: Infinity };
-  if (rows.length >= 15) {
-    [0.01, 0.1, 0.3, 1, 3, 10, 30].forEach(lambda => {
-      let e = 0;
-      for (let fold = 0; fold < 5; fold++) {
-        const tr = rows.filter((_, i) => i % 5 !== fold), te = rows.filter((_, i) => i % 5 === fold);
-        if (te.length && tr.length > k) e += err(train(tr, lambda), te) / 5;
-      }
-      if (e < best.cv) best = { lambda, cv: e };
-    });
-  } else best = { lambda: 3, cv: null };
-  const wts = train(rows, best.lambda);
-  return { lambda: best.lambda, cvErrorPx: best.cv === null ? null : Math.round(best.cv),
-           predict: f => { const x = z(f); return { x: dot(wts[0], x), y: dot(wts[1], x) }; } };
-}
+const shuffle = a => a.map(p => [Math.random(), p]).sort((p, q) => p[0] - q[0]).map(p => p[1]);
 
 // ---------- expressions (facial action proxies, not felt emotion)
 const EXPRESSIONS = [
@@ -94,6 +36,7 @@ function av(b, x, y) { return ((b[x] || 0) + (b[y] || 0)) / 2; }
 // ---------- adapter
 export function attachFace(h, opts = {}) {
   const fps = opts.fps || 15, sampleEvery = opts.sampleMs || 500, maxClicks = opts.maxClicks || 200;
+  const storeKey = opts.persist === false ? null : typeof opts.persist === 'string' ? opts.persist : 'heed-face:calibration';
   let ctx = null;
   h.use({ name: 'face', setup(c) {
     ctx = c;
@@ -109,16 +52,20 @@ export function attachFace(h, opts = {}) {
     expr: { smile: 0, browDown: 0, browUp: 0, jawOpen: 0, squint: 0, blink: 0 },
     expression: { label: 'neutral', meaning: '', valence: 'neutral', scores: {} },
     blinks: 0, blinkRate: 0, gaze: null, calibrated: false, landmarks: null,
-    model: { source: 'none', samples: 0, clicks: 0, cvErrorPx: null, validationErrorPx: null }
+    model: emptyModel(),
+    saved: null                          // { at, applied, reason } while a calibration is stored on this device
   };
   ctx.faceState = state;
+  function emptyModel() { return { source: 'none', samples: 0, clicks: 0, cvErrorPx: null, validationErrorPx: null, correctionPx: null, check: null, restoredFrom: null }; }
 
   let video, stream, landmarker, running = false, lastDetect = 0, lastSample = 0, startedAt = 0;
-  let model = null, smooth = null, latest = null, sink = null, refitTimer = 0;
+  let smooth = null, latest = null, sink = null, refitTimer = 0;
   let eyesClosed = false, blinkBase = null, closedAt = 0, blinkTimes = [], awaySince = 0, frames = 0, fpsT0 = 0;
   let gazeRegion = null, gazeSince = 0;
   const ring = [];                       // last ~1.5 s of frames for click lookup
-  const samples = { grid: [], pursuit: [], clicks: [] };
+  const gaze = createGaze({ maxClicks });
+  const peek = readSaved();
+  if (peek) state.saved = { at: peek.at, applied: false, reason: null };
   let exprBase = null, exprBaseBuf = [], exprSmooth = {}, episode = null, candidate = null;
 
   const emit = () => listeners.forEach(fn => { try { fn(state); } catch (e) { console.error('[heed-face]', e); } });
@@ -154,6 +101,7 @@ export function attachFace(h, opts = {}) {
     }
     running = true; state.status = 'running'; fpsT0 = performance.now(); frames = 0; startedAt = Date.now();
     ctx.record({ kind: 'face-start', calibrated: state.calibrated });
+    if (!gaze.model) restore();
     loop(); emit();
   }
 
@@ -228,8 +176,8 @@ export function attachFace(h, opts = {}) {
 
     updateExpression(bs, wall);
 
-    if (model && !eyesClosed) {
-      const g = model.predict(f.vec);
+    if (gaze.model && !eyesClosed) {
+      const g = gaze.predict(f.vec);
       smooth = smooth ? { x: smooth.x * 0.65 + g.x * 0.35, y: smooth.y * 0.65 + g.y * 0.35 } : g;
       const W = innerWidth, H = innerHeight;
       state.gaze = { x: clamp(smooth.x, -0.2, 1.2) * W, y: clamp(smooth.y, -0.2, 1.2) * H, onScreen: smooth.x >= 0 && smooth.x <= 1 && smooth.y >= 0 && smooth.y <= 1 };
@@ -300,20 +248,44 @@ export function attachFace(h, opts = {}) {
     if (r) { gazeRegion = r; gazeSince = Date.now(); }
   }
 
-  // ---------- model fitting
-  function allSamples() {
-    return samples.grid.map(s => Object.assign({ w: 3 }, s))
-      .concat(samples.pursuit.map(s => Object.assign({ w: 1 }, s)))
-      .concat(samples.clicks.map(s => Object.assign({ w: 2 }, s)));
-  }
+  // ---------- model fitting (the model lives in heed-gaze.js; this keeps the state in step)
   function refit(source) {
-    const all = allSamples();
-    if (all.length < 8) return false;
-    model = fitModel(all, innerWidth, innerHeight);
+    if (!gaze.refit(innerWidth, innerHeight)) return false;
+    const m = gaze.model, o = gaze.offset;
     state.calibrated = true; smooth = null;
-    state.model = Object.assign({}, state.model, { source: source || state.model.source, samples: all.length, clicks: samples.clicks.length, cvErrorPx: model.cvErrorPx });
+    state.model = Object.assign({}, state.model, { source: source || state.model.source, samples: gaze.all().length, clicks: gaze.samples.clicks.length, cvErrorPx: m.cvErrorPx,
+      correctionPx: o.x || o.y ? { x: Math.round(o.x * innerWidth), y: Math.round(o.y * innerHeight) } : null });
     emit();
     return true;
+  }
+
+  // ---------- persistence: samples, not frames; the next visit refits from them
+  function readSaved() {
+    if (!storeKey) return null;
+    try { const d = JSON.parse(localStorage.getItem(storeKey)); return d && d.v === STORE_VERSION ? d : null; } catch (e) { return null; }
+  }
+  function camera() {
+    const track = stream && stream.getVideoTracks()[0];
+    return { label: track ? track.label : '', aspect: video && video.videoHeight ? +(video.videoWidth / video.videoHeight).toFixed(3) : null };
+  }
+  function save() {
+    if (!storeKey || !gaze.model || !running) return false;
+    const d = Object.assign(gaze.toJSON(), { at: Date.now(), w: innerWidth, h: innerHeight, validationErrorPx: state.model.validationErrorPx }, camera());
+    try { localStorage.setItem(storeKey, JSON.stringify(d)); state.saved = { at: d.at, applied: true, reason: null }; return true; } catch (e) { return false; }
+  }
+  // A saved calibration only fits the camera and screen orientation it was made with.
+  function restore() {
+    const d = readSaved(), cam = camera();
+    if (!d) return;
+    const reason = d.label !== cam.label || Math.abs(d.aspect - cam.aspect) > 0.05 ? 'camera' : (d.w > d.h) !== (innerWidth > innerHeight) ? 'orientation' : null;
+    state.saved = { at: d.at, applied: false, reason };
+    if (reason) return;
+    gaze.load(d);
+    if (!refit('saved calibration')) { gaze.reset(); state.saved.reason = 'format'; return; }
+    state.saved.applied = true;
+    Object.assign(state.model, { validationErrorPx: d.validationErrorPx, restoredFrom: d.at });
+    ctx.record({ kind: 'calibration', ok: true, restored: true, savedAt: d.at, points: gaze.samples.grid.length, samples: gaze.all().length,
+                 pursuit: gaze.samples.pursuit.length, meanErrorPx: gaze.model.cvErrorPx, validationErrorPx: d.validationErrorPx, lambda: gaze.model.lambda });
   }
 
   // Every mouse click or tap is a labelled sample: people look where they click.
@@ -321,106 +293,170 @@ export function attachFace(h, opts = {}) {
     if (!running || !ring.length || (e.target && e.target.closest && e.target.closest('.heed-calib'))) return;
     const t = Date.now(), win = ring.filter(r => t - r.t <= 250 && t - r.t >= 0);
     if (win.length < 1) return;
-    const f = win[0].f.map((_, i) => median(win.map(r => r.f[i])));
-    samples.clicks.push({ x: e.clientX / innerWidth, y: e.clientY / innerHeight, f });
-    if (samples.clicks.length > maxClicks) samples.clicks.shift();
-    ctx.record({ kind: 'calibration-click', x: Math.round(e.clientX), y: Math.round(e.clientY), clicks: samples.clicks.length,
-                 predictedErrorPx: model ? Math.round(Math.hypot((model.predict(f).x - e.clientX / innerWidth) * innerWidth, (model.predict(f).y - e.clientY / innerHeight) * innerHeight)) : null });
+    const f = win[0].f.map((_, i) => median(win.map(r => r.f[i]))), s = { x: e.clientX / innerWidth, y: e.clientY / innerHeight, f };
+    gaze.addClick(s);
+    const g = gaze.model && gaze.predict(f);
+    ctx.record({ kind: 'calibration-click', x: Math.round(e.clientX), y: Math.round(e.clientY), clicks: gaze.samples.clicks.length,
+                 predictedErrorPx: g ? Math.round(Math.hypot((g.x - s.x) * innerWidth, (g.y - s.y) * innerHeight)) : null });
     clearTimeout(refitTimer);
-    refitTimer = setTimeout(() => refit(samples.grid.length ? 'calibration + clicks' : 'clicks only'), 250);
+    refitTimer = setTimeout(() => { if (refit(gaze.samples.grid.length ? 'calibration + clicks' : 'clicks only')) save(); }, 250);
   }
   document.addEventListener('pointerdown', onPointerDown, true);
+
+  // ---------- full-screen dot layer shared by calibration and the gaze check
+  function overlay(title, text) {
+    const layer = document.createElement('div');
+    layer.setAttribute('data-heed-ignore', '');
+    layer.className = 'heed-calib';
+    layer.innerHTML = '<div class="heed-calib-card"><b>' + title + '</b><p>' + text + '</p><button type="button" class="go">Start</button></div>' +
+      '<i></i><span class="heed-calib-status"></span><button type="button" class="cancel">Cancel</button>';
+    document.body.appendChild(layer);
+    ctx.calibrating = true;
+    const cancel = layer.querySelector('.cancel');
+    const o = { dot: layer.querySelector('i'), status: layer.querySelector('.heed-calib-status'), cancelled: false };
+    cancel.onclick = () => { o.cancelled = true; };
+    o.begin = () => new Promise(res => { layer.querySelector('.go').onclick = res; cancel.addEventListener('click', res); })
+      .then(() => layer.querySelector('.heed-calib-card').remove());
+    o.place = (x, y) => { o.dot.style.left = (x * 100) + '%'; o.dot.style.top = (y * 100) + '%'; };
+    // median features over at least ms and 5 frames (4 s at most); onFrame also sees each frame
+    o.collect = async (ms, onFrame) => {
+      const got = [];
+      sink = (f, t, bs) => { got.push(f); if (onFrame) onFrame(bs); };
+      const t0 = Date.now();
+      while (!o.cancelled && Date.now() - t0 < 4000 && !(Date.now() - t0 >= ms && got.length >= 5)) await wait(40);
+      sink = null;
+      return got.length >= 2 ? got[0].map((_, i) => median(got.map(g => g[i]))) : null;
+    };
+    // a fixation target: 700 ms for the eyes to land, then collect
+    o.fixate = async (x, y, ms, onFrame) => { o.place(x, y); o.dot.className = ''; await wait(700); o.dot.className = 'hold'; return o.collect(ms, onFrame); };
+    // result card; resolves with the data-act of the button pressed, or 'done' on cancel or after autoMs
+    o.finish = (html, buttons, autoMs) => {
+      o.dot.remove(); o.status.remove();
+      const card = document.createElement('div'); card.className = 'heed-calib-card';
+      card.innerHTML = html + '<div class="heed-calib-actions">' + buttons + '</div>';
+      layer.appendChild(card);
+      return new Promise(res => {
+        card.querySelectorAll('button').forEach(b => { b.onclick = () => res(b.dataset.act); });
+        cancel.addEventListener('click', () => res('done'));
+        if (autoMs) setTimeout(() => res('done'), autoMs);
+      });
+    };
+    o.close = () => { layer.remove(); ctx.calibrating = false; };
+    return o;
+  }
+  const grade = pct => pct <= 8 ? 'good' : pct <= 15 ? 'fair' : 'poor';
+  const saved = ok => !storeKey ? '' : ok ? ' It is saved on this device for your next visit.' : ' It could not be saved on this device (storage full or blocked), so it lasts until you leave the page.';
 
   // ---------- calibration: 17-point grid, smooth pursuit, validation
   async function calibrate(copts = {}) {
     if (!running) await start();
     if (!running) return false;
     const quick = !!copts.quick;
-    const layer = document.createElement('div');
-    layer.setAttribute('data-heed-ignore', '');
-    layer.className = 'heed-calib';
-    layer.innerHTML = '<div class="heed-calib-card"><b>Gaze calibration</b><p>About 50 seconds. Hold the device steady at a comfortable distance and keep your head still. Follow the dot with your eyes.</p><button type="button" class="go">Start</button></div>' +
-      '<i></i><span class="heed-calib-status"></span><button type="button" class="cancel">Cancel</button>';
-    document.body.appendChild(layer);
-    ctx.calibrating = true;
-    const dot = layer.querySelector('i'), status = layer.querySelector('.heed-calib-status'), card = layer.querySelector('.heed-calib-card');
-    let cancelled = false;
-    layer.querySelector('.cancel').onclick = () => { cancelled = true; };
-    await new Promise(res => { layer.querySelector('.go').onclick = res; layer.querySelector('.cancel').addEventListener('click', res); });
-    card.remove();
-    const place = (x, y) => { dot.style.left = (x * 100) + '%'; dot.style.top = (y * 100) + '%'; };
-    const baseBuf = [];
-    const collect = async (x, y, ms) => {
-      const got = [];
-      sink = (f, t, bs) => { got.push(f); const raw = {}; EXPRESSIONS.forEach(e => { raw[e.label] = e.score(bs); }); baseBuf.push(raw); };
-      const t0 = Date.now();
-      while (!cancelled && Date.now() - t0 < 4000 && !(Date.now() - t0 >= ms && got.length >= 5)) await wait(40);
-      sink = null;
-      return got.length >= 2 ? got[0].map((_, i) => median(got.map(g => g[i]))) : null;
-    };
+    const o = overlay('Gaze calibration', 'About 50 seconds. Hold the device steady at a comfortable distance and keep your head still. Follow the dot with your eyes.');
+    await o.begin();
+    const baseBuf = [], grid = [], pursuit = [];
+    const toBase = bs => { const raw = {}; EXPRESSIONS.forEach(e => { raw[e.label] = e.score(bs); }); baseBuf.push(raw); };
 
     // 1. grid (randomised order)
     const g4 = [0.06, 0.36, 0.64, 0.94];
-    let grid = quick ? [0.1, 0.5, 0.9].flatMap(y => [0.1, 0.5, 0.9].map(x => [x, y])) : g4.flatMap(y => g4.map(x => [x, y])).concat([[0.5, 0.5]]);
-    grid = grid.map(p => [Math.random(), p]).sort((a, b) => a[0] - b[0]).map(p => p[1]);
-    samples.grid = [];
-    for (let i = 0; i < grid.length && !cancelled; i++) {
-      const [x, y] = grid[i];
-      status.textContent = 'Point ' + (i + 1) + ' of ' + grid.length;
-      place(x, y); dot.className = ''; await wait(700); dot.className = 'hold';
-      const f = await collect(x, y, 900);
-      if (f) samples.grid.push({ x, y, f });
+    const targets = shuffle(quick ? [0.1, 0.5, 0.9].flatMap(y => [0.1, 0.5, 0.9].map(x => [x, y])) : g4.flatMap(y => g4.map(x => [x, y])).concat([[0.5, 0.5]]));
+    for (let i = 0; i < targets.length && !o.cancelled; i++) {
+      const [x, y] = targets[i];
+      o.status.textContent = 'Point ' + (i + 1) + ' of ' + targets.length;
+      const f = await o.fixate(x, y, 900, toBase);
+      if (f) grid.push({ x, y, f });
     }
     if (baseBuf.length >= 20) setBaseline(baseBuf);
 
     // 2. smooth pursuit: the dot glides along a Lissajous path; targets lag-compensated by 150 ms
-    if (!quick && !cancelled) {
-      samples.pursuit = [];
-      status.textContent = 'Follow the moving dot';
-      dot.className = 'pursuit';
-      const T = 14000, t0 = Date.now(), pos = t => { const s = t / 1000; return [0.5 + 0.43 * Math.sin(2 * Math.PI * s / 7), 0.5 + 0.42 * Math.sin(2 * Math.PI * s / 4.6 + Math.PI / 2)]; };
-      place(...pos(0)); await wait(900);
+    if (!quick && !o.cancelled) {
+      o.status.textContent = 'Follow the moving dot';
+      o.dot.className = 'pursuit';
+      const T = 14000, pos = t => { const s = t / 1000; return [0.5 + 0.43 * Math.sin(2 * Math.PI * s / 7), 0.5 + 0.42 * Math.sin(2 * Math.PI * s / 4.6 + Math.PI / 2)]; };
+      o.place(...pos(0)); await wait(900);
       const t1 = Date.now();
-      sink = (f, t) => { const [x, y] = pos(Math.max(0, t - t1 - 150)); if (t - t1 > 400) samples.pursuit.push({ x, y, f }); };
-      while (!cancelled && Date.now() - t1 < T) { place(...pos(Date.now() - t1)); await wait(16); }
+      sink = (f, t) => { const [x, y] = pos(Math.max(0, t - t1 - 150)); if (t - t1 > 400) pursuit.push({ x, y, f }); };
+      while (!o.cancelled && Date.now() - t1 < T) { o.place(...pos(Date.now() - t1)); await wait(16); }
       sink = null;
     }
 
-    // 3. fit, then validate on fresh points
-    if (cancelled || !refit(quick ? 'quick calibration' : 'calibration')) {
-      layer.remove(); ctx.calibrating = false;
-      ctx.record({ kind: 'calibration', ok: false, points: samples.grid.length });
+    // 3. fit, then validate on fresh points. A calibration starts afresh: of the older samples it keeps
+    // only this visit's clicks, and the offset restarts. Cancelling leaves the previous model as it was.
+    const undo = o.cancelled ? null : gaze.restart(grid, quick ? null : pursuit);
+    if (!undo || !refit(quick ? 'quick calibration' : 'calibration')) {
+      if (undo) undo();
+      o.close();
+      ctx.record({ kind: 'calibration', ok: false, points: grid.length });
       return false;
     }
     let validationErrorPx = null;
-    if (!quick && !cancelled) {
-      dot.className = '';
+    if (!quick && !o.cancelled) {
       const val = [[0.25, 0.2], [0.75, 0.22], [0.5, 0.5], [0.22, 0.78], [0.78, 0.8]], errs = [];
-      for (let i = 0; i < val.length && !cancelled; i++) {
-        status.textContent = 'Checking accuracy ' + (i + 1) + ' of ' + val.length;
-        const [x, y] = val[i]; place(x, y); dot.className = ''; await wait(700); dot.className = 'hold';
-        const f = await collect(x, y, 800);
-        if (f) { const p = model.predict(f); errs.push(Math.hypot((p.x - x) * innerWidth, (p.y - y) * innerHeight)); samples.grid.push({ x, y, f }); }
+      for (let i = 0; i < val.length && !o.cancelled; i++) {
+        o.status.textContent = 'Checking accuracy ' + (i + 1) + ' of ' + val.length;
+        const [x, y] = val[i];
+        const f = await o.fixate(x, y, 800);
+        if (f) { const p = gaze.model.predict(f); errs.push(Math.hypot((p.x - x) * innerWidth, (p.y - y) * innerHeight)); gaze.samples.grid.push({ x, y, f }); }
       }
       if (errs.length) validationErrorPx = Math.round(errs.reduce((a, b) => a + b, 0) / errs.length);
       refit('calibration');
     }
-    state.model.validationErrorPx = validationErrorPx;
+    Object.assign(state.model, { validationErrorPx, check: null, restoredFrom: null });
+    const stored = save();
     const diag = Math.hypot(innerWidth, innerHeight);
     const pct = validationErrorPx ? Math.round(validationErrorPx / diag * 100) : null;
-    const quality = pct === null ? '' : pct <= 8 ? 'good' : pct <= 15 ? 'fair' : 'poor';
-    ctx.record({ kind: 'calibration', ok: true, points: samples.grid.length, samples: allSamples().length, pursuit: samples.pursuit.length,
-                 meanErrorPx: model.cvErrorPx, validationErrorPx, validationPctOfScreen: pct, lambda: model.lambda });
-    if (validationErrorPx !== null && !cancelled) {
-      dot.remove(); status.remove();
-      const done = document.createElement('div'); done.className = 'heed-calib-card';
-      done.innerHTML = '<b>Calibration ' + quality + '</b><p>Average error on fresh points: ' + validationErrorPx + ' px, about ' + pct + '% of the screen diagonal. Each click or tap from now on refines it.</p><button type="button" class="go">Done</button>';
-      layer.appendChild(done);
-      await new Promise(res => { done.querySelector('.go').onclick = res; layer.querySelector('.cancel').addEventListener('click', res); setTimeout(res, 8000); });
+    ctx.record({ kind: 'calibration', ok: true, points: gaze.samples.grid.length, samples: gaze.all().length, pursuit: gaze.samples.pursuit.length,
+                 meanErrorPx: gaze.model.cvErrorPx, validationErrorPx, validationPctOfScreen: pct, lambda: gaze.model.lambda });
+    if (validationErrorPx !== null && !o.cancelled) {
+      await o.finish('<b>Calibration ' + grade(pct) + '</b><p>Average error on fresh points: ' + validationErrorPx + ' px, about ' + pct + '% of the screen diagonal. Each click or tap from now on refines it.' + saved(stored) + '</p>',
+        '<button type="button" class="go" data-act="done">Done</button>', 8000);
     }
-    layer.remove(); ctx.calibrating = false;
+    o.close();
     emit();
     return true;
+  }
+
+  // ---------- gaze check: 5 fixation targets measure how far and in which direction the gaze point
+  // misses, and set the offset from them. If a shift does not explain the miss, it offers a new calibration.
+  async function check() {
+    if (!running) await start();
+    if (!running) return null;
+    if (!gaze.model) return { recalibrated: await calibrate() };
+    const o = overlay('Gaze check', 'About 8 seconds. Look at each dot until it shrinks. heed measures how far off the gaze point is and corrects the offset.');
+    await o.begin();
+    const targets = shuffle([[0.5, 0.5], [0.2, 0.25], [0.8, 0.25], [0.2, 0.75], [0.8, 0.75]]), pts = [];
+    for (let i = 0; i < targets.length && !o.cancelled; i++) {
+      const [x, y] = targets[i];
+      o.status.textContent = 'Point ' + (i + 1) + ' of ' + targets.length;
+      const f = await o.fixate(x, y, 800);
+      if (f) pts.push({ x, y, f });
+    }
+    if (o.cancelled || pts.length < 3) {
+      if (!o.cancelled) await o.finish('<b>Gaze check incomplete</b><p>Your eyes were not visible on enough points. Try again in even light.</p>', '<button type="button" class="go" data-act="done">Done</button>', 8000);
+      o.close(); ctx.record({ kind: 'calibration-check', ok: false, points: pts.length });
+      return null;
+    }
+    const result = Object.assign({ ok: true, points: pts.length }, gaze.measure(pts, innerWidth, innerHeight)), { beforePx, afterPx } = result;
+    result.quality = grade(result.afterPct);
+    // the check points become the offset's evidence and calibration samples
+    gaze.addChecks(pts);
+    refit();
+    state.model.check = Object.assign({ at: Date.now() }, result);
+    save();
+    ctx.record(Object.assign({ kind: 'calibration-check' }, result));
+    const dx = result.offsetPx.x, dy = result.offsetPx.y, parts = [];
+    if (Math.abs(dx) >= 10) parts.push(Math.abs(dx) + ' px ' + (dx < 0 ? 'left' : 'right'));
+    if (Math.abs(dy) >= 10) parts.push(Math.abs(dy) + ' px ' + (dy < 0 ? 'above' : 'below'));
+    const where = parts.length ? 'The gaze point sat mostly ' + parts.join(' and ') + (Math.abs(dy) >= 10 ? ' the dot. ' : ' of the dot. ') : 'There was no consistent shift. ';
+    const poor = result.quality === 'poor';
+    const act = await o.finish('<b>Gaze check: ' + result.quality + '</b><p>Before: ' + beforePx + ' px off on average (' + result.beforePct + '% of the screen diagonal). ' + where +
+        'With the offset corrected: about ' + afterPx + ' px (' + result.afterPct + '%). ' + (poor ? 'A shift does not explain the error, so a new calibration should help.' : 'Clicks and taps keep it on target.') + '</p>',
+      poor ? '<button type="button" class="go" data-act="redo">Recalibrate</button><button type="button" data-act="done">Not now</button>' : '<button type="button" class="go" data-act="done">Done</button>',
+      poor ? 0 : 8000);
+    o.close();
+    emit();
+    if (act === 'redo') result.recalibrated = await calibrate();
+    return result;
   }
 
   const style = document.createElement('style');
@@ -428,6 +464,7 @@ export function attachFace(h, opts = {}) {
     '.heed-calib{position:fixed;inset:0;z-index:2147483600;background:var(--heed-card,#fff);color:var(--heed-card-fg,#09090b);font:15px/1.45 system-ui,-apple-system,sans-serif}' +
     '.heed-calib-card{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(360px,calc(100vw - 48px));display:grid;gap:10px;padding:20px;border:1px solid var(--heed-line,#e4e4e7);border-radius:12px;background:var(--heed-card,#fff)}' +
     '.heed-calib-card p{margin:0;color:var(--heed-muted,#71717a)}.heed-calib-card .go{justify-self:start;background:var(--heed-card-fg,#09090b);color:var(--heed-card,#fff);border-color:var(--heed-card-fg,#09090b)}' +
+    '.heed-calib-actions{display:flex;flex-wrap:wrap;gap:8px}' +
     '.heed-calib-status{position:absolute;left:50%;bottom:max(24px,env(safe-area-inset-bottom,0px));transform:translateX(-50%);font-size:13px;color:var(--heed-muted,#71717a)}' +
     '.heed-calib i{position:absolute;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;background:var(--heed-tint,#2563eb);transition:left .45s ease,top .45s ease,transform .2s}' +
     '.heed-calib i.hold{transform:scale(.5)}.heed-calib i.pursuit{transition:none;transform:scale(.6)}' +
@@ -437,10 +474,17 @@ export function attachFace(h, opts = {}) {
   document.head.appendChild(style);
 
   return {
-    state, start, stop, calibrate,
+    state, start, stop, calibrate, check,
     get video() { return video; },
     onFrame(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-    debug() { return { latest, eyesClosed, running, samples: { grid: samples.grid.length, pursuit: samples.pursuit.length, clicks: samples.clicks.length } }; },
-    resetCalibration() { model = null; samples.grid = []; samples.pursuit = []; samples.clicks = []; state.calibrated = false; state.gaze = null; emit(); }
+    debug() { const s = gaze.samples; return { latest, eyesClosed, running, offset: gaze.offset, samples: { grid: s.grid.length, pursuit: s.pursuit.length, clicks: s.clicks.length, checks: s.checks.length } }; },
+    // forgets the model, its samples and the copy saved on this device
+    resetCalibration() {
+      clearTimeout(refitTimer); closeGaze('reset');
+      gaze.reset();
+      state.calibrated = false; state.gaze = null; state.model = emptyModel(); state.saved = null;
+      if (storeKey) try { localStorage.removeItem(storeKey); } catch (e) {}
+      emit();
+    }
   };
 }

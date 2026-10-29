@@ -838,7 +838,7 @@
     var lanes = opts.lanes || [
       { name: 'Cursor', kinds: ['dwell'] }, { name: 'Gaze', kinds: ['gaze'] }, { name: 'In view', kinds: ['view'], noLabels: true },
       { name: 'Fixations', kinds: ['fixation'] }, { name: 'Typing', kinds: ['typing'] }, { name: 'Scroll', kinds: ['scroll'] },
-      { name: 'Actions', kinds: ['action', 'prompt', 'response', 'calibration'] }, { name: 'Presence', kinds: ['face', 'away', 'hidden', 'idle'] },
+      { name: 'Actions', kinds: ['action', 'prompt', 'response', 'calibration', 'calibration-check'] }, { name: 'Presence', kinds: ['face', 'away', 'hidden', 'idle'] },
       { name: 'Expression', kinds: ['emotion'] },
       { name: 'Findings', findings: true }
     ];
@@ -1097,7 +1097,7 @@
       return { expression: x.expression, possibleMeaning: x.meaning, seconds: sec(x.seconds * 1000), episodes: x.episodes, mostlyOn: top };
     }).sort(function (a, b) { return b.seconds - a.seconds; });
     var byType = {}; ex.findings.forEach(function (f) { byType[f.type] = (byType[f.type] || 0) + 1; });
-    var cal = count('calibration').filter(function (e) { return e.ok; }).pop();
+    var cal = count('calibration').filter(function (e) { return e.ok; }).pop(), chk = count('calibration-check').filter(function (e) { return e.ok; }).pop();
     var answers = count('response').map(function (e) { return { question: e.question, answer: e.answer, region: lab(e.region) }; });
     return {
       session: { minutes: Math.round((end - ex.started) / 6000) / 10, recordedMinutes: Math.round((end - ex.started - paused) / 6000) / 10, pausedSeconds: sec(paused),
@@ -1112,7 +1112,9 @@
                                 pauses: typing.reduce(function (a, e) { return a + e.pauses; }, 0), meanMsBetweenKeys: Math.round(typing.reduce(function (a, e) { return a + e.meanIKI; }, 0) / typing.length) } : null,
       behaviours: byType,
       samplingAnswers: answers,
-      calibration: cal ? { meanErrorPx: cal.meanErrorPx, validationErrorPx: cal.validationErrorPx, points: cal.points, samples: cal.samples } : null
+      calibration: cal || chk ? { meanErrorPx: cal ? cal.meanErrorPx : null, validationErrorPx: cal ? cal.validationErrorPx : null, points: cal ? cal.points : null, samples: cal ? cal.samples : null,
+                                  savedFromEarlierVisit: !!(cal && cal.restored),
+                                  lastCheck: chk ? { errorBeforePx: chk.beforePx, errorAfterOffsetCorrectionPx: chk.afterPx, offsetPx: chk.offsetPx } : null } : null
     };
   }
 

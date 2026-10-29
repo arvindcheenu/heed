@@ -2,14 +2,32 @@
 
 Attention-aware toolkit for any web page, with a playground at **https://heed.arvindchee.nu**. It captures where people attend (cursor, scroll, typing, actions, and with the camera on, face, expression and gaze), records it as events, shows it back on the page, and reduces a session to a factual report that an on-device LLM can narrate.
 
-Everything runs in the browser. Video frames never leave the device or get stored; heed keeps only derived numbers.
+Everything runs in the browser. Video frames never leave the device or get stored; heed keeps only derived numbers. The gaze calibration (those numbers, not images) is kept in the browser's local storage so the next visit can use it.
+
+## Run it locally
+
+No build and no install; the vendored files are in the repo. Serve the folder over HTTP, because ES modules and the camera do not work from `file://`:
+
+```sh
+python3 -m http.server 8000    # or: npx serve
+```
+
+Open http://localhost:8000. Browsers allow the camera on `localhost`. From a phone on the same network the camera needs HTTPS, so use the hosted playground or an HTTPS tunnel. The on-device summary downloads its model weights from Hugging Face the first time.
+
+Unit tests for the gaze model need Node 22 or later and nothing else:
+
+```sh
+node --test test/*.test.mjs
+```
 
 ## Files
 
 | File | What it is |
 | --- | --- |
 | `heed.js` | Core: kernel, spec, capture plugins, behaviours, renderers, matrices, timeline, report. No dependencies. |
-| `heed-face.js` | Camera plugin: face mesh, head pose, expressions, blinks, calibrated gaze that learns from clicks. |
+| `heed-face.js` | Camera plugin: face mesh, head pose, expressions, blinks, calibrated gaze that learns from clicks, saved calibration, gaze check. |
+| `heed-gaze.js` | The gaze model `heed-face.js` imports: features, ridge regression, offset correction, saved form. No DOM or camera, so it runs in Node. |
+| `test/` | Unit tests for `heed-gaze.js`, on Node's built-in test runner. |
 | `heed-llm.js` | Optional summary written by a small model running in the browser (WebLLM, WebGPU). |
 | `index.html` | Playground with a chat layout and a dashboard layout. |
 | `vendor/` | MediaPipe Face Landmarker 0.10.14 and model, WebLLM 0.2.85. Apache 2.0. |
@@ -17,10 +35,13 @@ Everything runs in the browser. Video frames never leave the device or get store
 ## Using the playground
 
 1. **Recording** (red dot, top left) pauses and resumes capture. While paused nothing is stored; open gaze dwell and expression episodes are saved at the moment you pause.
-2. **Start camera**, then **Calibrate gaze** (about 50 s on a phone). Hold the device steady.
-3. Read, check and accept or flag claims in **Chat** or **Dashboard**.
-4. Every **click or tap** after the camera starts adds a calibration sample and refits the gaze model. Without the full calibration, clicks alone start gaze after eight samples.
-5. **Build report**, then **Summarize on this device** for a narrative written from the report.
+2. **Start camera**, then **Calibrate gaze** (about 50 s on a phone). Hold the device steady. The calibration is saved, so on your next visit gaze works as soon as the camera starts.
+3. If the gaze dot sits off to one side of where you look, use **Check gaze** (about 8 s) to measure and correct the offset.
+4. Read, check and accept or flag claims in **Chat** or **Dashboard**.
+5. Every **click or tap** after the camera starts adds a calibration sample and refits the gaze model. Without the full calibration, clicks alone start gaze after eight samples.
+6. **Build report**, then **Summarize on this device** for a narrative written from the report.
+
+**Forget gaze calibration** (in the heed panel) deletes the saved calibration from this browser.
 
 Toggles: **Coverage** (tint by attention), **Trail** (path and numbered fixations), **Transitions** (arrows between regions, loops for refixations), **Notify** (toasts for behaviours).
 
@@ -34,6 +55,19 @@ Three phases, then continuous learning:
 4. **Clicks and taps**: each one pairs the median face features from the 250 ms before it with the click position. Weight 2, last 200 kept.
 
 The model is a weighted ridge regression on 22 features (head yaw, pitch, roll and position; iris position in each eye along and across the eye axis; eye openness; face position and size; and second-order terms), with the regularisation picked by 5-fold cross-validation. Expect region-level accuracy on a phone's front camera, best when the head stays near its calibration pose.
+
+### Saved between visits
+
+After a calibration, and after each click or check that changes the model, the labelled samples (feature numbers and target positions) are written to `localStorage` under `heed-face:calibration`. The next time the camera starts, heed refits the model from them, unless the camera or the screen orientation has changed. In that case it says so and leaves the saved copy for when they match again. A new calibration starts afresh: of the older samples it keeps only the clicks from the current visit. Cancelling a calibration leaves the previous one untouched.
+
+### Gaze check and offset correction
+
+Sitting a little differently from the calibration often shifts the whole gaze estimate in one direction. **Check gaze** shows 5 dots (centre and 4 quadrants), measures where heed placed your gaze for each, and reports:
+
+- **Before**: the average error, and in which direction the gaze point sat (e.g. "149 px right and 115 px above the dot").
+- **After**: the error once the offset is corrected. Each point is measured with the offset learned from the other four, so the figure is not flattered by its own data.
+
+The offset is the median miss over the visit's 8 most recent check points and clicks. It applies once there are 3, so a single careless click cannot move it far. After a check, the next clicks keep updating it. The check points also become calibration samples (weight 3, last 60 kept). If the error stays above 15% of the screen diagonal after the correction, a shift does not explain the error, and the card offers **Recalibrate**.
 
 ## Expressions
 
@@ -61,7 +95,7 @@ These are facial movements. The meaning column is one reading, and the report an
 
 ## Report and summary
 
-`heed.report(h)` returns counted facts: time recorded and paused, dwell and share per region, regions never attended, top moves and refixations, each claim with what happened to its evidence (checked, glanced, not looked at) and whether it contradicts its evidence (`data-heed-truth="false"` on the claim), idle and away time, expressions and where they happened, typing effort, calibration accuracy, and sampling answers.
+`heed.report(h)` returns counted facts: time recorded and paused, dwell and share per region, regions never attended, top moves and refixations, each claim with what happened to its evidence (checked, glanced, not looked at) and whether it contradicts its evidence (`data-heed-truth="false"` on the claim), idle and away time, expressions and where they happened, typing effort, calibration accuracy (and whether the calibration came from an earlier visit, plus the last gaze check), and sampling answers.
 
 `heed-llm.js` passes only that JSON to a small instruction model in the browser, with instructions to use only those facts and to describe expressions as movements. Models: Qwen2.5 0.5B (default on phones) or 1.5B (default on desktop), in 16-bit form where the GPU supports it, else 32-bit. Weights download once from Hugging Face and stay cached. Needs a browser with WebGPU; without it the page says so and the factual report stands on its own.
 
@@ -89,8 +123,10 @@ These are facial movements. The meaning column is one reading, and the report an
   import { attachFace } from './heed-face.js';
   import { summarize } from './heed-llm.js';
   const h = heed.create({ spec: { purpose: 'verify' } });
-  const face = attachFace(h);
-  await face.start(); await face.calibrate();
+  const face = attachFace(h);             // { persist: false } keeps the calibration for this page only
+  await face.start(); await face.calibrate();   // start() restores a saved calibration
+  const check = await face.check();       // { beforePx, afterPx, offsetPx, quality, ... }
+  face.resetCalibration();                // forgets the model and the saved copy
   h.pause(); h.resume();
   const facts = heed.report(h);
   const text = await summarize(facts, { size: 'small', onText: t => console.log(t) });
@@ -99,10 +135,14 @@ These are facial movements. The meaning column is one reading, and the report an
 
 Mark regions with `data-heed="<id>"` (optional `data-heed-label`, `data-heed-cites`, `data-heed-truth`), actions with `data-heed-action`, and UI to ignore with `data-heed-ignore`.
 
-Events: `dwell`, `view`, `gaze`, `fixation`, `typing`, `scroll`, `action`, `face`, `emotion`, `away`, `hidden`, `idle`, `calibration`, `calibration-click`, `recording`, `prompt`, `response`.
+Events: `dwell`, `view`, `gaze`, `fixation`, `typing`, `scroll`, `action`, `face`, `emotion`, `away`, `hidden`, `idle`, `calibration` (with `restored: true` when loaded from an earlier visit), `calibration-click`, `calibration-check`, `recording`, `prompt`, `response`.
 
 ## Tested (0.5)
 
 Headless Chrome on a 390×844 phone viewport with a face video as the camera: camera and model load from `vendor/`, face found (478 landmarks), neutral baseline, full calibration (22 points, pursuit, validation, result card), taps refining the model, pause storing nothing while the camera runs, gaze-based claim check, idle while still looking, a smile detected after a switch from a neutral to a smiling face and recorded with its region, the report using camera gaze, and no page errors or failed requests. Desktop Chrome: pause and resume, self-transitions in data and matrix, report, idle. WebKit (Safari's engine): face model (478 landmarks, 52 blendshapes, head transform) and page interactions. On-device summary: on a software (CPU-emulated) WebGPU adapter the model downloaded and the engine started, but generation was too slow to finish there (an 8-token reply ran past 25 minutes), so the written summary has not been seen yet; it needs a real GPU.
 
-Not tested: a real phone or real eye movement, the summary text on a real GPU (the test face is a photo, so gaze accuracy is unmeasured here), and Firefox.
+Saved calibration and gaze check: headless Chrome at 1280×800 with a synthetic face model in place of MediaPipe, whose iris landmarks follow a simulated point of regard. The test covered a full calibration (6 px validation error on that synthetic face), the saved copy surviving a reload, the restored model working without recalibrating, a cancelled recalibration keeping the old model and saved copy, and a simulated change in sitting position (error 9 → 193 px) that the check named by direction and corrected (to 16 px). It also covered clicks following a further drift (six clicks roughly halved the error, e.g. 143 → 70 px), a distortion that no offset explains (rated poor, with Recalibrate offered), a different camera not restoring, Forget clearing storage, `persist: false`, the report fields, and no page errors.
+
+Gaze model unit tests (`test/heed-gaze.test.mjs`, a synthetic face with landmark jitter): head pose from the transform, fitting a calibration (unseen points within 3% of the screen diagonal), a feature that differs only by rounding never acting as a predictor, the offset starting with the third click, a check measuring and correcting a pure shift and flagging a distortion, the saved form's round trip and its version and row checks, a new calibration keeping only the current visit's clicks (and undo), and the caps on clicks and check points.
+
+Not tested: a real phone or real eye movement (including for the saved calibration and the gaze check), the summary text on a real GPU (the test face is a photo, so gaze accuracy is unmeasured here), and Firefox.
